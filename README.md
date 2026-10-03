@@ -1,62 +1,6 @@
-# Wyckoff Bot v5.2 (BingX · Railway · Telegram)
+# Wyckoff Bot v5 (BingX · Railway · Telegram)
 
 Ejecuta en BingX las entradas del indicador **Wyckoff ES [theUltimator5]**. El motor (`wyckoff_engine.py`) es una traducción 1:1 de `f_engine()` del Pine: mismas constantes, fases A→E, resets y lógica de entrada (una por campaña según exigencia).
-
-## Evidencia que fija la configuración por defecto (2 oct 2026)
-Investigación con datos reales de BingX: 30 símbolos · 1h · 365 días · coste 0.08 %/lado.
-
-| | Operaciones | Media | PF | t |
-|---|---|---|---|---|
-| Indicador tal cual | 53 | −0.06R | 0.91 | −0.27 |
-| A favor de la EMA50 1h | 23 | **+0.42R** | 1.83 | +1.10 |
-| En contra de la EMA50 1h | 30 | −0.43R | 0.44 | −1.90 |
-| Trampa (estructura rota) | 45 | +0.00R | 1.01 | +0.02 |
-| 15m (solo 96 días en BingX) | 21 | −0.47R | 0.49 | −1.33 |
-
-Decisiones de la v5: **1h**, **TREND_FILTER=bloquea**, trampa **off**, meta-modelo **off** (no superó la prueba de azar).
-El filtro EMA es la mejor pista, **no** una certeza: salió de mirar ~15 desgloses (alguno destaca por azar) y con 23 operaciones.
-Por eso el bot arranca en SIGNAL y cada 20 operaciones manda un **veredicto** (media, t): solo con t≥2 en datos
-nuevos tiene sentido pasar a LIVE, y con riesgo mínimo.
-
-## v5.1 — ideas nuevas (todas medibles, todas OFF hasta que pasen la prueba)
-La evidencia de arriba dice que el indicador solo, sin filtrar, no tiene ventaja demostrada. Por eso lo nuevo **no se activa por fe**:
-cada idea se registra en cada señal (Telegram, `journal.csv`, backtest) y solo se usa para bloquear si el barrido 70/30 con Bonferroni lo avala.
-
-| Idea | Qué mide | Dónde se ve |
-|---|---|---|
-| `squeeze` | ATR(5)/ATR(50): compresión de volatilidad antes de la entrada (energía acumulada en Fase B) | desglose backtest, diario, Telegram |
-| `er` | Eficiencia de Kaufman 20 velas: serrucho vs tramo direccional agotado | idem |
-| `dry` | Volumen 5 velas / media 50: secado (“no hay oferta”) vs actividad | idem |
-| `clv`, `body` | Cierre y cuerpo de la vela de entrada con signo del lado: confirmación vs persecución | idem |
-| `wick_exc`, `vol_exc` | Mecha de rechazo y volumen de la vela del Spring/UTAD | idem |
-| `risk_atr` | Distancia al stop en ATR | idem |
-| `session`, `dow` | Sesión UTC (Asia/Europa/EEUU/Noche) y día de la semana | idem |
-| **Acelerador de capital** | Si las últimas `THROTTLE_N` operaciones suman < 0 R, el riesgo se multiplica por `THROTTLE_MULT` | línea “acelerador” del backtest; `risk_mult` en el diario |
-
-Cómo se prueba (en este orden):
-1. `python backtest.py ... --days 365` → mira los desgloses `[v5.1]` y la línea del acelerador (DD con y sin).
-2. `python sweep.py --modo edge --symbols ... --tf 1h --days 365` → 25 reglas, una a una; solo cuenta la columna **PRUEBA** y la ✓ exige ≥15 operaciones en prueba y Bonferroni.
-3. Si alguna pasa: `EDGE_FILTER=bloquea` y `EDGE_RULES=squeeze<0.85` (varias con coma = AND) en **SIGNAL** unas semanas y compara con el veredicto del bot.
-4. El acelerador es gestión de riesgo (no alfa): `THROTTLE_N=5`, `THROTTLE_MULT=0.5` recorta el tamaño en rachas malas. Mide su efecto en el DD del backtest antes de activarlo.
-`meta.py` ya incluye `squeeze, er, dry, clv, wick_exc` como features: un modelo antiguo sigue funcionando (guarda sus propias features).
-
-## v5.2 — más ideas medibles + estadística honesta
-Seis features nuevas (misma regla: se registran siempre, solo bloquean si `sweep.py --modo edge` las avala; **sin variables nuevas**):
-
-| Idea | Qué mide |
-|---|---|
-| `vr` | Razón de varianzas de Lo-MacKinlay (120 retornos, q=4): <1 reversión (rango real), >1 tendencia. Misma familia que tu z* de Wavelet Confirm |
-| `atr_pct` | Percentil de la volatilidad actual frente a las últimas 250 velas |
-| `depth` | Profundidad del Spring/UTAD más allá del borde del rango, en ATR |
-| `confirm` | Velas entre el Spring/UTAD y la entrada (rapidez de la recuperación) |
-| `avwap` | (VWAP anclado al clímax − entrada)/ATR con signo del lado: entrar con descuento o con recargo sobre el coste medio de la campaña |
-| `fund_h` | Horas hasta el próximo funding (00/08/16 UTC) |
-
-Herramientas de rigor (en el informe del backtest):
-- **IC 95 % de la media por bootstrap** y P(media>0): si el intervalo cruza 0, no se descarta la suerte.
-- **Drawdown Monte Carlo** por nivel de riesgo (mediana / peor 5 % / P(DD≥25 %)): sirve para elegir `RISK_PCT` con datos, no a ojo.
-- El motor ahora expone `clxT/clxP` (tiempo y precio del clímax) en su estado: solo lectura, la detección no cambia (`test_engine.py` da el mismo resultado).
-- `sweep.py --modo edge` pasa de 25 a 37 reglas y la corrección de Bonferroni lo tiene en cuenta (más reglas = umbral más exigente).
 
 ## Archivos
 
@@ -71,10 +15,11 @@ Herramientas de rigor (en el informe del backtest):
 | `config.py` | Variables de entorno (quita comillas) |
 | `backtest.py` | Backtest con el mismo motor/filtros/gestión, coste incluido, partición 70/30 y desgloses |
 | `meta.py` | Meta-etiquetado: un 2º modelo aprende qué señales del indicador tomar (walk-forward, purga, prueba de azar) |
-| `research.py` | Servicio de investigación en Railway (`RUN_MODE=research`): backtest + sweep + meta con datos reales, resultados a Telegram |
 | `sweep.py` | Barrido de variantes: elige en el 70% inicial, enseña el 30% final, corrige por nº de pruebas |
-| `edge.py` | **v5.1** Laboratorio de ideas nuevas: features (squeeze, ER, secado, cierre, mecha, sesión…), reglas `EDGE_RULES` y acelerador de capital |
 | `test_engine.py` | Prueba sin red con ciclos sintéticos |
+| `portfolio.py` | **v5** Cartera con los topes del bot + Monte Carlo + `RISK_PCT` recomendado |
+| `parity.py` | **v5** Compara las entradas del motor con las del indicador en TradingView (CSV exportado) |
+| `test_v5.py` | **v5** Pruebas sin red: libro, cambio de stop, caché, cartera, Monte Carlo, paridad |
 | `railway.env.txt` | Plantilla para el Raw Editor de Railway |
 
 ## Gestión de cada operación
@@ -99,7 +44,7 @@ Herramientas de rigor (en el informe del backtest):
 | Idea | Variable | Por defecto | Cómo se mide |
 |---|---|---|---|
 | TP2 más lejos (altura × N) | `TP2_MULT` | 1.0 (indicador) | `sweep.py --modo salidas` |
-| Trailing tras TP1 (cierre − N×ATR) | `TRAIL_ATR` | 0 = off (empeoró en el sweep) | `sweep.py --modo salidas` |
+| Trailing tras TP1 (cierre − N×ATR) | `TRAIL_ATR` | 0 = off | `sweep.py --modo salidas` |
 | Salida por tiempo si no llega a TP1 | `TIME_STOP_BARS` | 0 = off | `sweep.py --modo salidas` |
 | Estructura de BTC a favor/en contra | `BTC_FILTER` | aviso | desglose "por BTC" del backtest |
 | Funding en la señal (lado amontonado) | — | registro | columna `funding` del diario |
@@ -130,13 +75,6 @@ Un segundo motor Wyckoff corre en 4h. Cada señal sale marcada **a favor / en co
 3. Volumen montado en `/data`.
 4. Arranca en `MODE=SIGNAL`. Para operar: `MODE=LIVE` **y** `CONFIRM_LIVE=SI`.
 
-## Investigación en Railway (sin ordenador)
-1. En el mismo proyecto: **New → GitHub Repo → el mismo repo del bot** (servicio nuevo, p. ej. `wyckoff-research`).
-2. Variables → Raw Editor → pega `railway.research.env.txt` (con tu token y chat de Telegram). Sin claves de BingX: no opera.
-3. Settings → región **Europa** (en EE. UU. Binance devuelve 451 y no hay flujo agresor; funciona igual con datos de BingX).
-4. Deploy. En 10-30 min llega a Telegram el resumen + el informe completo (+ `meta_model.json` solo si supera la prueba de azar).
-5. Al terminar queda en reposo. Para repetir con otros parámetros: cambia variables y Redeploy. Cuando acabes, borra el servicio.
-
 ## Antes de LIVE
 ```
 pip install requests
@@ -147,3 +85,22 @@ python sweep.py --modo salidas  --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSD
 python meta.py --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,AVAXUSDT,DOTUSDT --tf 15m --days 365 --incluir-trampas
 ```
 Manda la columna de **prueba** del sweep y la **prueba de azar** de meta.py. `meta.py --guardar` solo si la prueba de azar da <5%.
+
+## Novedades v5
+| Mejora | Variable | Qué resuelve |
+|---|---|---|
+| **Cambio de stop sin hueco** | — | Tras TP1 y en el trailing, el stop nuevo se coloca ANTES de cancelar el viejo (antes había unos instantes sin stop). Si el nuevo no entra (precio ya al otro lado), el viejo se queda. |
+| **Guarda del libro de órdenes** | `MAX_SLIP_R`, `DEPTH_LEVELS` | Antes de abrir, recorre el libro y estima spread + impacto en R. Si cuesta más de `MAX_SLIP_R` (0.10R) o el libro no tiene fondo, no entra. Importante con cientos de símbolos poco líquidos. |
+| **Caché de motores** | `ENGINE_CACHE`, `ENGINE_CACHE_EVERY_MIN` | Guarda los motores en `/data` cada 30 min y al recibir SIGTERM. Un reinicio de Railway tarda segundos (con ~300 símbolos × 2 TF, el recálculo son minutos). La caché se invalida sola si cambia `wyckoff_engine.py` o la exigencia. Comprobado: tras restaurar, el motor da exactamente lo mismo que uno que nunca se paró. |
+| **Cartera + Monte Carlo** | `RISK_TARGET_DD` | `backtest.py` ahora pasa las operaciones por los topes reales (máx. posiciones, misma dirección, pérdida diaria, enfriamiento), compone el capital y calcula la caída máxima. Monte Carlo reordena las operaciones y dice cuánta caída esperar y qué `RISK_PCT` cabe en tu tolerancia. |
+| **Paridad con TradingView** | — | `parity.py` compara entradas del motor y del indicador sobre las mismas velas. Hasta que no coincidan, el backtest mide "el motor de Python", no "el indicador". |
+| **Backtest con velas de BingX** | `--source` | Por defecto usa BingX (donde opera el bot), no Binance. El volumen es lo que más alimenta al motor. |
+| **Desgloses nuevos** | — | Por sesión (Asia/Europa/EE.UU.), fin de semana y distancia del stop. |
+
+### Orden recomendado antes de LIVE
+```
+python test_engine.py && python test_v5.py
+python parity.py --csv BINGX_BTCUSDT.P_60.csv --tf 1h --expected expected.csv   # ¿mismo resultado que TradingView?
+python backtest.py --symbols BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT --tf 1h --days 365
+python sweep.py --modo entradas --symbols ... --tf 1h --days 365
+```

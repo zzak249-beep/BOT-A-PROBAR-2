@@ -1,7 +1,7 @@
 """Configuración desde variables de entorno. Todos los parsers quitan comillas (lección de Railway)."""
 import os
 
-CODE_VERSION = "wyckoff-bot 5.2.0 (2026-10-02)"
+CODE_VERSION = "wyckoff-bot 5.0.0 (2026-10-02)"
 
 
 def _raw(name, default):
@@ -54,7 +54,7 @@ TG_TOKEN = _s("TELEGRAM_TOKEN", "") or _s("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = _s("TELEGRAM_CHAT_ID", "")
 
 # ── Universo ──
-TIMEFRAMES = [x.strip().lower() for x in _s("TIMEFRAMES", _s("TIMEFRAME", "1h")).split(",") if x.strip()]
+TIMEFRAMES = [x.strip().lower() for x in _s("TIMEFRAMES", _s("TIMEFRAME", "15m")).split(",") if x.strip()]
 TIMEFRAME = TIMEFRAMES[0]                        # compatibilidad
 SYMBOLS = _list("SYMBOLS", "")                   # vacío = automático
 UNIVERSE = _s("UNIVERSE", "all").lower()         # all = todos los perpetuos · top = los AUTO_TOP_N con más volumen
@@ -83,7 +83,7 @@ else:
 # ── Plan y filtros (los del indicador v2) ──
 SL_BUFFER_ATR = _f("SL_BUFFER_ATR", 0.25)
 MIN_RR = _f("MIN_RR", 1.5)                       # R:R mínimo hasta TP2 (0 = sin filtro)
-TREND_FILTER = _s("TREND_FILTER", "bloquea").lower()  # off | aviso | bloquea (v5: bloquea, ver README "Evidencia")
+TREND_FILTER = _s("TREND_FILTER", "aviso").lower()  # off | aviso | bloquea
 TREND_TF = _s("TREND_TF", "1h")
 TREND_EMA = _i("TREND_EMA", 50)
 CONTEXT_TF = _s("CONTEXT_TF", "4h").lower()      # estructura Wyckoff de TF superior (vacío = sin contexto)
@@ -99,18 +99,19 @@ TIME_STOP_BARS = _i("TIME_STOP_BARS", 0)        # cierra si en N velas no toca T
 BTC_FILTER = _s("BTC_FILTER", "aviso").lower()  # off | aviso | bloquea: estructura de BTC en CONTEXT_TF (solo cripto)
 MAX_SAME_SIDE = _i("MAX_SAME_SIDE", 0)          # máx. posiciones en la misma dirección (0 = sin tope)
 # ── v4: ideas nuevas ──
-FAIL_TRADES = _s("FAIL_TRADES", "off").lower()  # off | aviso | on: operar a los atrapados cuando la estructura se rompe
+FAIL_TRADES = _s("FAIL_TRADES", "aviso").lower()  # off | aviso | on: operar a los atrapados cuando la estructura se rompe
 FAIL_SL_ATR = _f("FAIL_SL_ATR", 1.0)              # stop de la trampa: nivel duro ± X×ATR
 FAIL_NEEDS_ENTRY = _b("FAIL_NEEDS_ENTRY", False)  # true = solo estructuras que llegaron a dar entrada
 FLOW_SOURCE = _s("FLOW_SOURCE", "binance").lower() # binance | off: compra/venta agresora (no hay en BingX)
 BREADTH_FILTER = _s("BREADTH_FILTER", "aviso").lower()  # off | aviso | bloquea: amplitud Wyckoff en contra
 META_MODEL = _s("META_MODEL", "meta_model.json")  # modelo entrenado con meta.py --guardar
-META_FILTER = _s("META_FILTER", "off").lower()  # off | aviso | bloquea (bloquea por debajo del umbral)
-# ── v5.1: laboratorio de ideas nuevas (edge.py). Todo OFF hasta que `sweep.py --modo edge` lo avale ──
-EDGE_FILTER = _s("EDGE_FILTER", "off").lower()  # off | bloquea (aplica EDGE_RULES)
-EDGE_RULES = _s("EDGE_RULES", "")                # ej. "squeeze<0.8,clv>0" (AND). Claves: squeeze er dry clv body wick_exc vol_exc risk_atr vr atr_pct depth confirm avwap fund_h session dow
-THROTTLE_N = _i("THROTTLE_N", 0)                 # acelerador de capital: mira las últimas N operaciones (0 = off)
-THROTTLE_MULT = _f("THROTTLE_MULT", 0.5)         # riesgo × esto si esas N suman < 0 R
+META_FILTER = _s("META_FILTER", "aviso").lower()  # off | aviso | bloquea (bloquea por debajo del umbral)
+# ── v5 ──
+MAX_SLIP_R = _f("MAX_SLIP_R", 0.10)             # no entra si spread + profundidad del libro cuestan más de X R (0 = off)
+DEPTH_LEVELS = _i("DEPTH_LEVELS", 20)
+ENGINE_CACHE = _b("ENGINE_CACHE", True)         # guarda los motores en /data: reinicio en segundos, no en minutos
+ENGINE_CACHE_EVERY_MIN = _i("ENGINE_CACHE_EVERY_MIN", 30)
+RISK_TARGET_DD = _f("RISK_TARGET_DD", 20.0)     # % de caída máxima tolerada (95% de los casos) para recomendar RISK_PCT
 ATTACH_SL = _b("ATTACH_SL", True)               # SL dentro de la orden de entrada (sin ventana desnuda)
 MOVE_SL_TO_BE = _b("MOVE_SL_TO_BE", True)
 
@@ -128,7 +129,6 @@ SLIPPAGE_PCT = _f("SLIPPAGE_PCT", 0.03)          # deslizamiento por lado (%) qu
 CANDLE_DELAY_S = _i("CANDLE_DELAY_S", 8)         # espera tras el cierre de vela
 MANAGE_EVERY_S = _i("MANAGE_EVERY_S", 30)
 SIGNAL_COOLDOWN_MIN = _i("SIGNAL_COOLDOWN_MIN", 60)
-VERDICT_EVERY = _i("VERDICT_EVERY", 20)          # cada N operaciones cerradas: veredicto estadístico en Telegram
 STATUS_EVERY_H = _f("STATUS_EVERY_H", 12)
 ZOMBIE_ALERT_HOURS = _f("ZOMBIE_ALERT_HOURS", 72)
 IDLE_ALERT_DAYS = _f("IDLE_ALERT_DAYS", 7)

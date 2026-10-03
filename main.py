@@ -9,9 +9,27 @@ Ciclo:
   · LIVE:   orden a mercado con el SL DENTRO de la orden + TP1 parcial + TP2; tras TP1, SL a breakeven;
             vigila en cada ciclo que la posición tenga stop y lo repone si falta
 """
+# ── Autorreparación de dependencias ──
+# Si Railway no instaló requirements.txt (archivo ausente/mal nombrado en el repo), se instala aquí en el arranque
+# en vez de caer en bucle con "No module named 'requests'".
+try:
+    import requests  # noqa: F401
+except ModuleNotFoundError:
+    import subprocess
+    import sys as _sys
+    for _extra in ([], ["--break-system-packages"]):
+        try:
+            subprocess.check_call([_sys.executable, "-m", "pip", "install", "--no-cache-dir", "-q", "requests>=2.31"] + _extra)
+            break
+        except (subprocess.CalledProcessError, OSError):
+            continue
+    import requests  # noqa: F401
+
+import hashlib
 import json
 import logging
 import os
+import pickle
 import signal
 import sys
 import time
@@ -22,8 +40,8 @@ from datetime import datetime, timezone
 import requests
 
 import config as C
-from edge import EDGE_KEYS, edge_features, throttle_mult
-from bingx import BingX, BingXError
+import wyckoff_engine
+from bingx import BingX, BingXError, walk_book
 from notify import Journal, Telegram
 from universe import is_tradfi
 from strategy import (FAIL_KIND, MetaModel, TradeSim, alignment, breadth_label, build_fail_signal, build_signal,
@@ -37,6 +55,7 @@ logging.basicConfig(level=getattr(logging, C.LOG_LEVEL.upper(), logging.INFO),
 log = logging.getLogger("main")
 
 STATE_PATH = os.path.join(C.DATA_DIR, "state.json")
+CACHE_PATH = os.path.join(C.DATA_DIR, "engines.pkl")
 ALL_TFS = list(dict.fromkeys(C.TIMEFRAMES + ([C.CONTEXT_TF] if C.CONTEXT_TF else [])))
 
 
@@ -83,6 +102,7 @@ class Bot:
         self.meta = self.load_meta()
         self.state = self.load_state()
         self.last_status = time.time()
+        self.last_cache = time.time()
 
     def load_meta(self):
         if C.META_FILTER == "off":
@@ -96,6 +116,74 @@ class Bot:
                 except (OSError, ValueError, KeyError) as e:
                     log.warning("meta-modelo %s ilegible: %s", path, e)
         return None
+
+
+    # ── caché de motores: reiniciar sin repetir minutos de cálculo ──
+    def engine_signature(self):
+        h = hashlib.md5()
+        with open(wyckoff_engine.__file__, "rb") as f:
+            h.update(f.read())
+        h.update(f"{C.ENTRY_STRICTNESS}|{C.ENGINE_KEEP_BARS}|{C.TRADFI_EFFORT}".encode())
+        return h.hexdigest()
+
+    def save_engines(self):
+        if not C.ENGINE_CACHE or not self.engines:
+            return
+        try:
+            tmp = CACHE_PATH + ".tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump({"sig": self.engine_signature(), "ts": time.time(), "engines": self.engines}, f,
+                            protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, CACHE_PATH)
+            self.last_cache = time.time()
+            log.info("caché de motores guardada (%d)", len(self.engines))
+        except (OSError, pickle.PickleError) as e:
+            log.warning("no se pudo guardar la caché de motores: %s", e)
+
+    def load_engines(self):
+        if not C.ENGINE_CACHE or not os.path.exists(CACHE_PATH):
+            return 0
+        try:
+            with open(CACHE_PATH, "rb") as f:
+                blob = pickle.load(f)
+            if blob.get("sig") != self.engine_signature():
+                log.info("caché de motores de otra versión/configuración: se descarta")
+                return 0
+            self.engines.update(blob["engines"])
+            return len(blob["engines"])
+        except Exception as e:  # caché corrupta: se reconstruye, nunca debe impedir el arranque
+            log.warning("caché de motores ilegible (%s): se reconstruye", e)
+            return 0
+
+    def catch_up_many(self):
+        """Pone al día los motores cargados de la caché con las velas que se perdieron mientras estaba parado."""
+        def one(key):
+            sym, tf = key
+            eng, ms = self.engines[key], tf_ms(tf)
+            gap = int((now_ms() - eng.last_t) // ms)
+            if gap <= 1:
+                return key, 0
+            if gap > 1300:
+                return key, -1  # demasiado viejo: se reconstruye entero
+            try:
+                rows = self.ex.klines(sym, tf, gap + 3)
+            except BingXError:
+                return key, -1
+            n, cut = 0, now_ms()
+            for t, o, h, l, c, v in rows:
+                if t > eng.last_t and t + ms <= cut:
+                    eng.last_t = t
+                    if not dead_bar(o, h, l, c, v):
+                        eng.update(t, o, h, l, c, v)
+                    n += 1
+            return key, n
+        drop = 0
+        for key, n in self.pool.map(one, list(self.engines)):
+            if n < 0:
+                del self.engines[key]
+                drop += 1
+        if drop:
+            log.info("caché: %d motores demasiado antiguos, se reconstruyen", drop)
 
     def fp(self, x, sym):
         pp = self.ex.contracts.get(sym, {}).get("pp", 6)
@@ -134,24 +222,6 @@ class Bot:
         return (f"{st['n']} ops · acierto {self.wr()}% · media {avg:+.3f}R · total {st['sum_r']:+.2f}R · PF {pf}"
                 + (" (muestra pequeña: un dibujo, no evidencia)" if st["n"] < 30 else ""))
 
-    def verdict(self, rs):
-        """Juicio honesto del rendimiento acumulado (SIGNAL o LIVE): ¿la media es distinguible de cero?"""
-        import math
-        n = len(rs)
-        m = sum(rs) / n
-        sd = math.sqrt(sum((x - m) ** 2 for x in rs) / (n - 1)) if n > 1 else 0
-        t = m / (sd / math.sqrt(n)) if sd > 0 else 0
-        last = rs[-C.VERDICT_EVERY:]
-        ml = sum(last) / len(last)
-        if t >= 2 and m > 0:
-            v = "✅ ventaja positiva distinguible del azar (t≥2). Si es SIGNAL, candidato a LIVE con riesgo mínimo."
-        elif t <= -2:
-            v = "🛑 pierde de forma consistente (t≤−2). Para y revisa antes de seguir."
-        else:
-            v = "⏳ aún no distinguible de cero. Sigue midiendo."
-        self.tg.send(f"📐 <b>Veredicto tras {n} operaciones</b>\nmedia {m:+.3f}R · t {t:+.2f} · total {sum(rs):+.2f}R\n"
-                     f"últimas {len(last)}: media {ml:+.3f}R\n{v}")
-
     def roll_day(self):
         d = utc_day()
         if self.state["daily"]["day"] != d:
@@ -174,11 +244,6 @@ class Bot:
         self.state["last_trade"] = time.time()
         self.state["idle_warned"] = False
         self.save_state()
-        rs = self.state.setdefault("rs", [])
-        rs.append(round(r, 4))
-        self.save_state()
-        if C.VERDICT_EVERY > 0 and len(rs) % C.VERDICT_EVERY == 0:
-            self.verdict(rs)
         if dl["r"] <= -C.MAX_DAILY_LOSS_R:
             self.tg.send(f"🛑 Pérdida diaria {dl['r']:+.2f}R ≥ {C.MAX_DAILY_LOSS_R}R: sin nuevas aperturas hasta 00:00 UTC.")
 
@@ -218,6 +283,11 @@ class Bot:
                 syms.append(s)  # no abandonar lo que está abierto
         if C.CONTEXT_TF and "BTC-USDT" in self.ex.contracts and "BTC-USDT" not in syms and "crypto" in C.CATEGORIES:
             syms.append("BTC-USDT")  # contexto de BTC para las señales de alts
+        if not self.engines and C.ENGINE_CACHE:
+            n = self.load_engines()
+            if n:
+                self.catch_up_many()
+                log.info("caché: %d motores cargados y al día", len(self.engines))
         jobs = [(s, tf) for s in syms for tf in ALL_TFS if (s, tf) not in self.engines]
         self.warmup_many(jobs)
         for key in list(self.engines):
@@ -306,18 +376,6 @@ class Bot:
         except (requests.RequestException, ValueError, IndexError) as e:
             log.debug("flujo %s: %s", sym, e)
             return None, None
-
-    def edge(self, sym, tf, sig, fail, d):
-        """Ideas v5.1 (edge.py) con las mismas velas cerradas que usa el backtest. Solo registro salvo EDGE_FILTER."""
-        try:
-            ms = tf_ms(tf)
-            rows = [r for r in self.ex.klines(sym, tf, 520) if r[0] + ms <= now_ms()]
-            exc = None if fail else (d["excT"] if d["excT"] == d["excT"] else d["testT"])
-            return edge_features(rows, sig["side"], sig["atr"], sig["entry"], sig["sl"], exc, d["time"] + ms, d["rh"], d["rl"],
-                                 None if fail else d["excP"], d.get("clxT"))
-        except Exception as e:  # registro: nunca debe impedir la señal
-            log.debug("edge %s: %s", sym, e)
-            return {}
 
     def breadth(self, sym, tf, side):
         st = [wyckoff_state(e.last) for (s, t), e in self.engines.items() if t == tf and s != sym]
@@ -423,7 +481,6 @@ class Bot:
         sig["funding"], flabel = self.funding(sym)
         sig["flow"], sig["flow_exc"] = self.flow(sym, tf, sig["side"], None if fail else (
             d["excT"] if d["excT"] == d["excT"] else d["testT"]))
-        sig.update(self.edge(sym, tf, sig, fail, d))
         sig["breadth"] = self.breadth(sym, tf, sig["side"])
         sig["breadth_align"] = breadth_label(sig["breadth"])
         why = filters(sig, C, sig["trend"], alignment(sig["side"], cdir),
@@ -466,10 +523,6 @@ class Bot:
                                                               if sig["flow_exc"] is not None else "")
                   if sig["flow"] is not None else "")
                + (f"\n🧭 Amplitud Wyckoff {sig['breadth']:+.2f} ({sig['breadth_align']})" if sig["breadth"] is not None else "")
-               + (f"\n🧪 squeeze {sig['squeeze']} · ER {sig['er']} · secado {sig['dry']} · cierre {sig['clv']:+.2f}"
-                  + (f" · mecha {sig['wick_exc']}" if sig.get("wick_exc") is not None else "") + f" · {sig['session']}"
-                  if sig.get("squeeze") is not None and sig.get("er") is not None and sig.get("dry") is not None
-                  and sig.get("clv") is not None and sig.get("session") else "")
                + (f"\n🧠 Meta-modelo p={sig['meta_p']:.2f} (umbral {self.meta.thr:.2f})" if sig["meta_p"] is not None else "")
                + (f"\n🪤 Estructura rota: los del {'Spring' if sig['side'] == 'SHORT' else 'UTAD'} quedan atrapados"
                   if fail else "")
@@ -513,7 +566,6 @@ class Bot:
                             "funding": s.get("funding"), "range_atr": s.get("range_atr"), "b_bars": s.get("b_bars"),
                             "flow": s.get("flow"), "flow_exc": s.get("flow_exc"), "breadth": s.get("breadth"),
                             "meta_p": s.get("meta_p"),
-                            **{k: s.get(k) for k in EDGE_KEYS}, "risk_mult": s.get("risk_mult", 1.0),
                             "exit_reason": sim.reason, "mode": "SIGNAL"})
         self.tg.send(f"{'✅' if r > 0 else '❌'} Virtual {s['side']} {sym} cerrada por {sim.reason}: {r:+.2f}R "
                      f"(hoy {self.state['daily']['r']:+.2f}R · total {self.state['stats']['sum_r']:+.2f}R)")
@@ -550,14 +602,17 @@ class Bot:
         if adv > C.CHASE_MAX_R or (price - sig["sl"]) * d <= 0:
             self.tg.send(txt + f"\n⏸ No se persigue: el precio ya avanzó {adv:+.2f}R")
             return
-        mult = throttle_mult(self.state.get("rs", []), C.THROTTLE_N, C.THROTTLE_MULT)
-        sig["risk_mult"] = mult
-        qty = equity * C.RISK_PCT * mult / 100.0 / abs(price - sig["sl"])
+        qty = equity * C.RISK_PCT / 100.0 / abs(price - sig["sl"])
         qty = ex.fmt_qty(sym, min(qty, avail * C.LEVERAGE * 0.9 / price))
         c = ex.contracts[sym]
         if qty <= 0 or qty < c["min_qty"] or qty * price < max(c["min_usdt"], 2.0):
             self.tg.send(txt + f"\n⏸ Tamaño insuficiente ({qty}) para equity {equity:.2f}")
             return
+        if C.MAX_SLIP_R > 0:
+            ok_book, why_book = self.book_guard(sym, long, qty, risk)
+            if not ok_book:
+                self.tg.send(txt + f"\n⏸ {why_book}")
+                return
         ex.set_margin_mode(sym, C.MARGIN_MODE)
         ex.set_leverage(sym, C.LEVERAGE)
         cid = f"wyk{int(time.time())}{sym.split('-')[0][:6]}"
@@ -613,8 +668,26 @@ class Bot:
         self.save_state()
         slip = (entry - sig["entry"]) / sig["entry"] * 100 * d
         self.tg.send(txt + f"\n✅ <b>LIVE</b> abierta {amt} @ {self.fp(entry, sym)} (desliz. {slip:+.3f}%)"
-                     + (" · SL en la orden" if self.attach_ok else "")
-                     + (f" · riesgo ×{mult} (racha en rojo)" if mult != 1.0 else ""))
+                     + (" · SL en la orden" if self.attach_ok else ""))
+
+
+    def book_guard(self, sym, long, qty, risk):
+        """Estima el coste de llenar `qty` a mercado recorriendo el libro (spread + impacto) en R."""
+        try:
+            bids, asks = self.ex.depth(sym, C.DEPTH_LEVELS)
+        except BingXError as e:
+            log.warning("libro %s: %s", sym, e)
+            return True, ""  # sin libro no se bloquea: es una protección, no un requisito
+        if not bids or not asks:
+            return True, ""
+        mid = (bids[0][0] + asks[0][0]) / 2.0
+        avg = walk_book(asks if long else bids, qty)
+        if avg is None:
+            return False, f"libro con poca profundidad para {qty} (primeros {C.DEPTH_LEVELS} niveles)"
+        cost_r = (avg - mid) * (1 if long else -1) / max(risk, 1e-12)
+        if cost_r > C.MAX_SLIP_R:
+            return False, f"impacto estimado {cost_r:.2f}R > {C.MAX_SLIP_R}R (spread + profundidad del libro)"
+        return True, ""
 
     def manage_bar(self, sym, tf, c, atr):
         """Al cierre de cada vela del TF de la posición: salida por tiempo y trailing tras TP1 (si están activos)."""
@@ -643,11 +716,9 @@ class Bot:
             cur = rec.get("trail_stop") or (rec["entry_real"] if rec["be"] else rec["sl"])
             new = self.ex.fmt_px(sym, c - d * C.TRAIL_ATR * atr)
             if (new - cur) * d > self.ex.contracts[sym]["tick"]:
-                for o in self._stops(sym, long):
-                    self.ex.cancel(sym, o.get("orderId"))
-                rec["trail_stop"], rec["sl_id"] = new, ""
-                self.ensure_sl(sym, rec, amt, quiet=True)
-                self.save_state()
+                if self.replace_stop(sym, rec, amt, new):
+                    rec["trail_stop"] = new
+                    self.save_state()
 
     def ensure_sl(self, sym, rec, amt, at_open=False, quiet=False):
         """Garantiza que la posición tiene stop. Si no lo tiene, lo pone; si no puede, cierra (al abrir) o avisa."""
@@ -682,6 +753,23 @@ class Bot:
                 return False
             self.tg.send(f"🚨 {sym}: SIN STOP ({e}). Pon el SL a mano en BingX YA.")
             return True
+
+
+    def replace_stop(self, sym, rec, amt, level):
+        """Coloca el stop NUEVO antes de cancelar el viejo: nunca hay una ventana sin stop.
+        Si el nuevo no se puede colocar (p. ej. ya está del lado equivocado del precio), el viejo se queda."""
+        long = rec["side"] == "LONG"
+        old = [str(o.get("orderId")) for o in self._stops(sym, long) if o.get("orderId")]
+        try:
+            new_id = str(self.ex.exit_order(sym, long, "STOP_MARKET", amt, level))
+        except BingXError as e:
+            log.warning("replace_stop %s @%s: %s", sym, level, e)
+            return False
+        for oid in old:
+            if oid != new_id:
+                self.ex.cancel(sym, oid)
+        rec["sl_id"] = new_id
+        return True
 
     def _stops(self, sym, long):
         try:
@@ -727,15 +815,17 @@ class Bot:
             amt = abs(float(pos["positionAmt"]))
             if not rec.get("half") and amt <= rec["qty"] * (1 - C.TP1_FRACTION) * 1.02:
                 rec["half"] = True
-                # el SL original cubre la cantidad completa: se sustituye por uno de la cantidad restante
-                for o in [{"orderId": rec.get("sl_id")}] + self._stops(sym, long):
-                    if o.get("orderId"):
-                        ex.cancel(sym, o["orderId"])
-                rec["sl_id"], rec["be"] = "", C.MOVE_SL_TO_BE
+                rec["be"] = C.MOVE_SL_TO_BE
                 self.tg.send(f"🎯 {sym} TP1 tocado" + (f" · SL a breakeven {self.fp(rec['entry_real'], sym)}"
                                                         if C.MOVE_SL_TO_BE else ""))
                 self.save_state()
-                self.ensure_sl(sym, rec, amt, quiet=True)  # nuevo SL (BE) con la cantidad restante
+                # el SL original cubre la cantidad completa: se sustituye por uno de la cantidad restante,
+                # colocando el nuevo ANTES de cancelar el viejo
+                level = rec["entry_real"] if rec["be"] else rec["sl"]
+                if not self.replace_stop(sym, rec, amt, level) and rec["be"]:
+                    rec["be"] = False  # el BE ya no es válido (precio al otro lado): mismo SL, cantidad restante
+                    if not self.replace_stop(sym, rec, amt, rec["sl"]):
+                        self.tg.send(f"⚠ {sym}: no pude ajustar el stop tras TP1; el SL original sigue puesto.")
             self.ensure_sl(sym, rec, amt)  # guardián: repone el stop si falta
             hours = (time.time() - rec["open_ts"]) / 3600
             if hours > C.ZOMBIE_ALERT_HOURS and not rec.get("zombie"):
@@ -787,9 +877,7 @@ class Bot:
                             "btc_align": rec.get("btc_align"), "funding": rec.get("funding"),
                             "range_atr": rec.get("range_atr"), "b_bars": rec.get("b_bars"),
                             "flow": rec.get("flow"), "flow_exc": rec.get("flow_exc"), "breadth": rec.get("breadth"),
-                            "meta_p": rec.get("meta_p"),
-                            **{k: rec.get(k) for k in EDGE_KEYS}, "risk_mult": rec.get("risk_mult", 1.0),
-                            "mode": "LIVE"})
+                            "meta_p": rec.get("meta_p"), "mode": "LIVE"})
         self.tg.send(f"{'✅' if r > 0 else '❌'} {rec['side']} {sym} cerrada por {reason}: {r:+.2f}R "
                      f"en {mins:.0f} min (hoy {self.state['daily']['r']:+.2f}R)")
 
@@ -927,6 +1015,8 @@ class Bot:
                         self.process_tf(tf)
                         next_close[tf] = (now_ms() // tf_ms(tf) + 1) * tf_ms(tf)
                     self.status()
+                    if time.time() - self.last_cache > C.ENGINE_CACHE_EVERY_MIN * 60:
+                        self.save_engines()
                 if time.time() - last_manage >= C.MANAGE_EVERY_S:
                     self.manage()
                     last_manage = time.time()
@@ -938,13 +1028,10 @@ class Bot:
                 self.tg.send(f"⚠ Error en el ciclo: {e}")
                 time.sleep(10)
             time.sleep(1)
+        self.save_engines()  # parada limpia (SIGTERM de Railway): el siguiente arranque es inmediato
 
 
 def main():
-    if os.getenv("RUN_MODE", "").strip().strip('"').lower() == "research":
-        import research  # servicio de investigación: backtest + sweep + meta, resultados a Telegram
-        research.run()
-        return
     log.info("%s | %s", C.CODE_VERSION, C.summary())
     bot = Bot()
 

@@ -70,9 +70,7 @@ class Telegram:
 class Journal:
     FIELDS = ["open_time", "close_time", "symbol", "tf", "side", "kind", "entry_expected", "entry_real", "slippage_pct",
               "sl", "tp1", "tp2", "rr_plan", "qty", "exit_reason", "r_net", "minutes", "conf", "val",
-              "against_trend", "ctx_align", "ctx_label", "btc_align", "funding", "range_atr", "b_bars", "flow", "flow_exc", "breadth", "meta_p",
-              "squeeze", "er", "dry", "clv", "body", "wick_exc", "vol_exc", "risk_atr", "session", "dow",
-              "vr", "atr_pct", "depth", "confirm", "avwap", "fund_h", "risk_mult", "mode"]
+              "against_trend", "ctx_align", "ctx_label", "btc_align", "funding", "range_atr", "b_bars", "flow", "flow_exc", "breadth", "meta_p", "mode"]
 
     def __init__(self, data_dir):
         self.path = os.path.join(data_dir, "journal.csv")
