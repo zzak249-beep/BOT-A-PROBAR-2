@@ -9,8 +9,11 @@ Salidas configurables (para medir, no para creer):
   TIME_STOP  cierra a mercado si en N velas no ha tocado TP1 (0 = off, indicador)
 """
 import bisect
+import functools
 import json
 import math
+
+from edge import edge_features, parse_rules, violations
 
 from wyckoff_engine import (DIR_ACCUM, DIR_DIST, ENTRY_NAMES, PHASE_A, PHASE_C, PHASE_E, PHASE_NAMES, TYPE_NAMES,
                             WyckoffEngine, na)
@@ -154,7 +157,8 @@ def apply_breadth(cands, timelines):
 
 # ── IDEA NUEVA: meta-etiquetado (un segundo modelo decide qué señales del indicador tomar) ──
 META_FEATURES = ("val", "conf", "rr", "range_atr", "log_b", "risk_pct", "ctx", "btc", "ema", "flow", "flow_exc",
-                 "breadth", "long", "kind_lps", "kind_sos", "kind_fail")
+                 "breadth", "long", "kind_lps", "kind_sos", "kind_fail",
+                 "squeeze", "er", "dry", "clv", "wick_exc")  # v5.1: edge.py (un modelo antiguo guarda sus propias feats)
 
 
 def _align_num(x):
@@ -171,6 +175,8 @@ def meta_features(c):
         "breadth": c.get("breadth"), "long": 1.0 if c.get("side") == "LONG" else 0.0,
         "kind_lps": 1.0 if "LPS" in k else 0.0, "kind_sos": 1.0 if "SOS" in k else 0.0,
         "kind_fail": 1.0 if k == FAIL_KIND else 0.0,
+        "squeeze": c.get("squeeze"), "er": c.get("er"), "dry": c.get("dry"), "clv": c.get("clv"),
+        "wick_exc": c.get("wick_exc"),
     }
 
 
@@ -262,6 +268,11 @@ def alignment(side, ctx_dir):
     return "a favor" if ctx_dir == d else "en contra"
 
 
+@functools.lru_cache(maxsize=64)
+def _rules(text):
+    return parse_rules(text)
+
+
 def filters(sig, cfg, trend, ctx_align="neutral", btc_align="neutral"):
     """Lista de motivos por los que NO se abre (vacía = se puede abrir)."""
     why = []
@@ -279,6 +290,8 @@ def filters(sig, cfg, trend, ctx_align="neutral", btc_align="neutral"):
         why.append(f"estructura {cfg.CONTEXT_TF} en contra")
     if btc_align == "en contra" and cfg.BTC_FILTER == "bloquea":
         why.append(f"estructura de BTC {cfg.CONTEXT_TF} en contra")
+    if getattr(cfg, "EDGE_FILTER", "off") == "bloquea" and getattr(cfg, "EDGE_RULES", ""):
+        why += violations(sig, _rules(cfg.EDGE_RULES))
     return why
 
 
@@ -356,9 +369,9 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
     etiquetas de filtro; el backtest aplica después filtros + "una posición a la vez" de forma exacta.
     htf_ema: [(cierre_ms, ema)]; ctx_rows / btc_rows: velas del TF de contexto del símbolo y de BTC."""
     exits = exits or [exit_variant(cfg)]
-    eng = WyckoffEngine(tf_s, tick, strict, keep_bars=100000, range_effort=range_effort)
-    ctx = WyckoffEngine(ctx_tf_s, tick, strict, keep_bars=100000, range_effort=range_effort) if ctx_rows else None
-    btc = WyckoffEngine(ctx_tf_s, 0.1, strict, keep_bars=100000) if (btc_rows and ctx_tf_s) else None
+    eng = WyckoffEngine(tf_s, tick, strict, keep_bars=1500, range_effort=range_effort)
+    ctx = WyckoffEngine(ctx_tf_s, tick, strict, keep_bars=1500, range_effort=range_effort) if ctx_rows else None
+    btc = WyckoffEngine(ctx_tf_s, 0.1, strict, keep_bars=1500) if (btc_rows and ctx_tf_s) else None
     j = k = kb = 0
     ema = float("nan")
     cands, opens = [], []
@@ -403,14 +416,12 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
         base = mk(exits[0][0])
         if base is None:
             continue
-        base["flow"], base["flow_exc"] = flow_features(
-            base["side"], rows[max(0, idx - 40):idx + 1],
-            None if is_fail else (d["excT"] if not na(d["excT"]) else d["testT"]))
+        exc_ts = None if is_fail else (d["excT"] if not na(d["excT"]) else d["testT"])
+        base["flow"], base["flow_exc"] = flow_features(base["side"], rows[max(0, idx - 40):idx + 1], exc_ts)
+        base.update(edge_features(rows[max(0, idx - 500):idx + 1], base["side"], d["atr"], base["entry"], base["sl"],
+                                  exc_ts, bar_close, d["rh"], d["rl"], None if is_fail else d["excP"], d.get("clxT")))
         cdir, clabel = context_of(ctx.last if ctx is not None else None)
         bdir, blabel = context_of(btc.last if btc is not None else None)
-        look = max(int(30 * 86400 / tf_s), 50)  # movimiento previo: cambio de precio en los 30 días anteriores
-        prior = round((c / rows[idx - look][4] - 1) * 100, 1) if idx >= look and rows[idx - look][4] > 0 else None
-        base.update(prior_move=prior)
         base.update(symbol=symbol, trend=trend_dir(c, ema), ctx_dir=cdir, ctx_label=clabel,
                     ctx_align=alignment(base["side"], cdir), btc_label=blabel,
                     btc_align=alignment(base["side"], bdir) if btc is not None else "neutral",

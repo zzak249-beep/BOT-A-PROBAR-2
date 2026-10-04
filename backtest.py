@@ -21,14 +21,16 @@ from statistics import NormalDist
 import requests
 
 import config as C
-import portfolio
+from edge import bootstrap_ci, mc_drawdown, throttled_curve
 from strategy import FAIL_KIND, META, MetaModel, apply_breadth, scan_candidates, select_trades
 
 TIMELINES = {}
+COVERAGE = {}
+_WARNED = set()
 
 BINANCE = "https://fapi.binance.com/fapi/v1/klines"
 BINGX = "https://open-api.bingx.com/openApi/swap/v3/quote/klines"
-SOURCE = "bingx"  # v5: por defecto las MISMAS velas que opera el bot (BingX). auto/binance solo para estudiar el flujo agresor
+SOURCE = "auto"  # auto: BingX para TradFi (NC...-USDT) y símbolos con guion; Binance para el resto
 
 
 def use_bingx(symbol):
@@ -130,13 +132,19 @@ def btc_rows(cfg, start, end):
 
 def load_symbol(sym, tf, days, warmup, strict, cfg, exits=None):
     tf_s = C.tf_seconds(tf)
-    warmup = max(warmup, int(30 * 86400 / tf_s))  # historia previa suficiente para medir el movimiento de 30 días
     end = int(time.time() * 1000) // 3600000 * 3600000
     start = end - days * 86400000 - warmup * tf_s * 1000
     rows = [r for r in fetch(sym, tf, start, end) if r[0] + tf_s * 1000 <= end]
     if len(rows) < warmup + 50:
         print(f"{sym}: pocas velas ({len(rows)})")
         return []
+    got = (rows[-1][0] - rows[0][0]) / 86400000 - warmup * tf_s / 86400
+    COVERAGE[(sym, tf)] = (rows[0][0], rows[-1][0], got)
+    if got < days * 0.8 and (sym, tf) not in _WARNED:
+        _WARNED.add((sym, tf))
+        print(f"⚠ {sym}: solo hay {got:.0f} días útiles de {tf} (pedidos {days})"
+              + (" — BingX guarda poco histórico en TF bajos; con Binance (región Europa) o 1h hay más"
+                 if use_bingx(sym) else ""))
     ema = None
     if cfg.TREND_FILTER != "off":
         ms = C.tf_seconds(cfg.TREND_TF) * 1000
@@ -211,6 +219,20 @@ def report(trades, n_tests):
                "solo el umbral clásico (t≥2)" if m["t"] >= 2 else "NO distinguible de cero")
     print(f"t {m['t']:+.2f} → {verdict} · Bonferroni con {n_tests} pruebas: {crit:.2f} "
           f"({'pasa' if m['t'] >= crit else 'no pasa'})")
+    rs_all = [x["r"] for x in trades]
+    ci = bootstrap_ci(rs_all)
+    if ci:
+        print(f"IC 95% de la media (bootstrap): [{ci[0]:+.3f}R, {ci[1]:+.3f}R] · P(media>0) = {ci[2]:.0%}"
+              + ("  ← el intervalo cruza 0: no se puede descartar que sea suerte" if ci[0] <= 0 <= ci[1] else ""))
+    if len(rs_all) >= 10:
+        print("Drawdown esperable (Monte Carlo, riesgo fijo por operación) — mediana / peor 5% / P(DD≥25%):")
+        for rp in sorted({0.25, 0.5, 1.0, C.RISK_PCT}):
+            mc = mc_drawdown(rs_all, rp)
+            print(f"  riesgo {rp:>4}%  →  {mc[0]:5.1f}%  /  {mc[1]:5.1f}%  /  {mc[2]:.1%}")
+    n_thr = C.THROTTLE_N or 5
+    tot, dd, cut = throttled_curve([x["r"] for x in trades], n_thr, C.THROTTLE_MULT)
+    print(f"acelerador de capital (últimas {n_thr} ops < 0 → riesgo ×{C.THROTTLE_MULT}): total {tot:+.2f}R · DD {dd:.2f}R "
+          f"· {cut} ops recortadas   (sin acelerador: {m['tot']:+.2f}R · DD {m['dd']:.2f}R)")
     groups = defaultdict(lambda: defaultdict(list))
     for x in trades:
         groups["lado"][x["side"]].append(x["r"])
@@ -226,15 +248,21 @@ def report(trades, n_tests):
         groups["flujo agresor últimas 10 velas"][bucket_n(x.get("flow"), (-0.05, 0.05), ("en contra", "neutro", "a favor"))].append(x["r"])
         groups["flujo agresor en el Spring/UTAD"][bucket_n(x.get("flow_exc"), (-0.1, 0.1), ("venta/compra absorbida", "neutro", "a favor"))].append(x["r"])
         groups["amplitud Wyckoff (resto de símbolos)"][x.get("breadth_align", "-")].append(x["r"])
-        pm = x.get("prior_move")
-        pb = bucket_n(pm, (-40, -15, 15, 40), ("cayó >40%", "cayó 15-40%", "medio ±15%", "subió 15-40%", "subió >40%"))
-        groups["movimiento previo 30 días"][pb].append(x["r"])
-        groups["lado × movimiento previo"][f"{x['side']} · {pb}"].append(x["r"])
-        hr = datetime.fromtimestamp(x["open_t"] / 1000, timezone.utc)
-        groups["sesión de apertura (UTC)"][("Asia 00-08", "Europa 08-16", "EE.UU. 16-24")[hr.hour // 8]].append(x["r"])
-        groups["día de la semana"]["fin de semana" if hr.weekday() >= 5 else "entre semana"].append(x["r"])
-        groups["distancia del stop (% precio)"][bucket(x.get("risk_pct", 0), (1, 2.5, 5), ("<1", "1-2.5", "2.5-5", "5+"))].append(x["r"])
-        groups["mes"][hr.strftime("%Y-%m")].append(x["r"])
+        groups["[v5.1] squeeze ATR5/ATR50"][bucket_n(x.get("squeeze"), (0.7, 1.0), ("<0.7 comprimido", "0.7-1.0", ">1.0 agitado"))].append(x["r"])
+        groups["[v5.1] eficiencia previa (ER 20)"][bucket_n(x.get("er"), (0.15, 0.35), ("<0.15 serrucho", "0.15-0.35", ">0.35 direccional"))].append(x["r"])
+        groups["[v5.1] secado de volumen"][bucket_n(x.get("dry"), (0.8, 1.2), ("<0.8 seco", "0.8-1.2", ">1.2 activo"))].append(x["r"])
+        groups["[v5.1] cierre vela de entrada"][bucket_n(x.get("clv"), (-0.3, 0.3), ("débil", "medio", "fuerte a favor"))].append(x["r"])
+        groups["[v5.1] mecha rechazo Spring/UTAD"][bucket_n(x.get("wick_exc"), (0.25, 0.5), ("<25%", "25-50%", ">50%"))].append(x["r"])
+        groups["[v5.1] volumen del Spring/UTAD"][bucket_n(x.get("vol_exc"), (1.0, 2.0), ("<1x", "1-2x", ">2x"))].append(x["r"])
+        groups["[v5.2] razón de varianzas VR(4)"][bucket_n(x.get("vr"), (0.9, 1.1), ("<0.9 reversión", "0.9-1.1 azar", ">1.1 tendencia"))].append(x["r"])
+        groups["[v5.2] percentil de volatilidad (ATR)"][bucket_n(x.get("atr_pct"), (25, 75), ("<25 baja", "25-75", ">75 alta"))].append(x["r"])
+        groups["[v5.2] profundidad del Spring/UTAD (ATR)"][bucket_n(x.get("depth"), (0.3, 1.0), ("<0.3 superficial", "0.3-1.0", ">1.0 profundo"))].append(x["r"])
+        groups["[v5.2] velas Spring→entrada"][bucket_n(x.get("confirm"), (4, 12), ("<4 rápida", "4-11", "12+ lenta"))].append(x["r"])
+        groups["[v5.2] entrada vs VWAP anclado al clímax"][bucket_n(x.get("avwap"), (-0.5, 0.5), ("cara (> coste medio)", "en el coste", "barata (< coste medio)"))].append(x["r"])
+        groups["[v5.2] horas hasta funding"][bucket_n(x.get("fund_h"), (2, 6), ("<2h", "2-6h", "6-8h"))].append(x["r"])
+        groups["[v5.1] sesión UTC"][x.get("session") or "sin dato"].append(x["r"])
+        groups["[v5.1] día de la semana"][x.get("dow") or "sin dato"].append(x["r"])
+        groups["mes"][datetime.fromtimestamp(x["open_t"] / 1000, timezone.utc).strftime("%Y-%m")].append(x["r"])
         groups["símbolo"][x["symbol"]].append(x["r"])
     for g, d in groups.items():
         print(f"\n— por {g} —")
@@ -242,7 +270,6 @@ def report(trades, n_tests):
             print(f"  {str(k):<16} " + line(metrics(d[k])))
     if m["n"] < 30:
         print(f"\n⚠ {m['n']} operaciones: un dibujo, no evidencia.")
-    portfolio.report(trades, C)
 
 
 def main():
@@ -263,11 +290,14 @@ def main():
     ap.add_argument("--fail", default=C.FAIL_TRADES, help="off | aviso | on (incluir las trampas en el resultado)")
     ap.add_argument("--breadth-filter", default=C.BREADTH_FILTER, help="off | aviso | bloquea")
     ap.add_argument("--meta-filter", default="off", help="off | bloquea (aplica meta_model.json)")
-    ap.add_argument("--source", default="bingx", help="bingx (por defecto: las velas que opera el bot) | binance | auto")
+    ap.add_argument("--edge-rules", default=C.EDGE_RULES, help='v5.1: ej. "squeeze<0.8,clv>0" (AND); requiere --edge-filter bloquea')
+    ap.add_argument("--edge-filter", default=C.EDGE_FILTER, help="off | bloquea")
+    ap.add_argument("--source", default="auto", help="auto | binance | bingx (TradFi: usa BingX, p. ej. NCFXEUR2USD-USDT)")
     args = ap.parse_args()
     C.TREND_FILTER, C.CONTEXT_TF, C.CONTEXT_FILTER, C.MIN_RR = args.trend, args.context_tf, args.context_filter, args.min_rr
     C.TP2_MULT, C.TRAIL_ATR, C.TIME_STOP_BARS, C.BTC_FILTER = args.tp2_mult, args.trail_atr, args.time_stop, args.btc_filter
     C.FAIL_TRADES, C.BREADTH_FILTER, C.META_FILTER = args.fail, args.breadth_filter, args.meta_filter
+    C.EDGE_FILTER, C.EDGE_RULES = args.edge_filter, args.edge_rules
     global SOURCE
     SOURCE = args.source
     syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -275,9 +305,6 @@ def main():
         syms = [s.replace("-", "") for s in syms]
     elif SOURCE == "bingx":
         syms = [s if "-" in s else s.replace("USDT", "-USDT") for s in syms]
-    if SOURCE != "bingx":
-        print("⚠ Backtest con velas de Binance (volumen distinto al de BingX, que es donde opera el bot). "
-              "Solo es válido para estudiar el flujo agresor; para decidir, usa --source bingx.")
     print(f"Backtest {args.tf} · {args.days} días · exigencia {args.strict} · EMA {C.TREND_FILTER} · "
           f"contexto {C.CONTEXT_TF or '-'} {C.CONTEXT_FILTER} · BTC {C.BTC_FILTER} · R:R≥{C.MIN_RR}\n"
           f"salida: TP2×{C.TP2_MULT} · trailing {C.TRAIL_ATR or 'off'} · tiempo {C.TIME_STOP_BARS or 'off'}"
