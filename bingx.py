@@ -143,6 +143,29 @@ class BingX:
 
         return sorted(lv(d.get("bids")), key=lambda x: -x[0]), sorted(lv(d.get("asks")), key=lambda x: x[0])
 
+    def premium_info(self, symbol):
+        """(funding %, prima mark/index %) del símbolo. Cada parte puede ser None."""
+        d = self._req("GET", "/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
+        if isinstance(d, list):
+            d = d[0] if d else {}
+        d = d or {}
+        fr = d.get("lastFundingRate")
+        fr = None if fr in (None, "") else float(fr) * 100
+        try:
+            mk, ix = float(d.get("markPrice")), float(d.get("indexPrice"))
+            pr = (mk / ix - 1) * 100 if ix > 0 else None
+        except (TypeError, ValueError):
+            pr = None
+        return fr, pr
+
+    def open_interest(self, symbol):
+        """Interés abierto actual (unidades del contrato). None si BingX no lo da para ese símbolo."""
+        d = self._req("GET", "/openApi/swap/v2/quote/openInterest", {"symbol": symbol})
+        if isinstance(d, list):
+            d = d[0] if d else {}
+        v = (d or {}).get("openInterest")
+        return None if v in (None, "") else float(v)
+
     def funding_rate(self, symbol):
         d = self._req("GET", "/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
         if isinstance(d, list):

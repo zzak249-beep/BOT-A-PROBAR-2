@@ -9,11 +9,8 @@ Salidas configurables (para medir, no para creer):
   TIME_STOP  cierra a mercado si en N velas no ha tocado TP1 (0 = off, indicador)
 """
 import bisect
-import functools
 import json
 import math
-
-from edge import edge_features, parse_rules, violations
 
 from wyckoff_engine import (DIR_ACCUM, DIR_DIST, ENTRY_NAMES, PHASE_A, PHASE_C, PHASE_E, PHASE_NAMES, TYPE_NAMES,
                             WyckoffEngine, na)
@@ -157,8 +154,7 @@ def apply_breadth(cands, timelines):
 
 # ── IDEA NUEVA: meta-etiquetado (un segundo modelo decide qué señales del indicador tomar) ──
 META_FEATURES = ("val", "conf", "rr", "range_atr", "log_b", "risk_pct", "ctx", "btc", "ema", "flow", "flow_exc",
-                 "breadth", "long", "kind_lps", "kind_sos", "kind_fail",
-                 "squeeze", "er", "dry", "clv", "wick_exc")  # v5.1: edge.py (un modelo antiguo guarda sus propias feats)
+                 "breadth", "long", "kind_lps", "kind_sos", "kind_fail")
 
 
 def _align_num(x):
@@ -175,8 +171,6 @@ def meta_features(c):
         "breadth": c.get("breadth"), "long": 1.0 if c.get("side") == "LONG" else 0.0,
         "kind_lps": 1.0 if "LPS" in k else 0.0, "kind_sos": 1.0 if "SOS" in k else 0.0,
         "kind_fail": 1.0 if k == FAIL_KIND else 0.0,
-        "squeeze": c.get("squeeze"), "er": c.get("er"), "dry": c.get("dry"), "clv": c.get("clv"),
-        "wick_exc": c.get("wick_exc"),
     }
 
 
@@ -268,11 +262,6 @@ def alignment(side, ctx_dir):
     return "a favor" if ctx_dir == d else "en contra"
 
 
-@functools.lru_cache(maxsize=64)
-def _rules(text):
-    return parse_rules(text)
-
-
 def filters(sig, cfg, trend, ctx_align="neutral", btc_align="neutral"):
     """Lista de motivos por los que NO se abre (vacía = se puede abrir)."""
     why = []
@@ -290,8 +279,6 @@ def filters(sig, cfg, trend, ctx_align="neutral", btc_align="neutral"):
         why.append(f"estructura {cfg.CONTEXT_TF} en contra")
     if btc_align == "en contra" and cfg.BTC_FILTER == "bloquea":
         why.append(f"estructura de BTC {cfg.CONTEXT_TF} en contra")
-    if getattr(cfg, "EDGE_FILTER", "off") == "bloquea" and getattr(cfg, "EDGE_RULES", ""):
-        why += violations(sig, _rules(cfg.EDGE_RULES))
     return why
 
 
@@ -315,6 +302,12 @@ class TradeSim:
 
     def _net(self, r):
         return r - 2.0 * self.cost / 100.0 * self.e / self.risk
+
+    def mark(self, c):
+        """R neta si se cierra a mercado al precio c (salida por estructura). Respeta el parcial de TP1 si ya se tocó."""
+        r1 = (self.t1 - self.e) * self.d / self.risk
+        rc = (c - self.e) * self.d / self.risk
+        return self._net(self.f * r1 + (1 - self.f) * rc if self.half else rc)
 
     def step(self, bar, h, l, c=None, atr=None):
         """Devuelve R neta al cerrar, o None si sigue abierta. self.reason dice cómo cerró."""
@@ -369,9 +362,9 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
     etiquetas de filtro; el backtest aplica después filtros + "una posición a la vez" de forma exacta.
     htf_ema: [(cierre_ms, ema)]; ctx_rows / btc_rows: velas del TF de contexto del símbolo y de BTC."""
     exits = exits or [exit_variant(cfg)]
-    eng = WyckoffEngine(tf_s, tick, strict, keep_bars=1500, range_effort=range_effort)
-    ctx = WyckoffEngine(ctx_tf_s, tick, strict, keep_bars=1500, range_effort=range_effort) if ctx_rows else None
-    btc = WyckoffEngine(ctx_tf_s, 0.1, strict, keep_bars=1500) if (btc_rows and ctx_tf_s) else None
+    eng = WyckoffEngine(tf_s, tick, strict, keep_bars=100000, range_effort=range_effort)
+    ctx = WyckoffEngine(ctx_tf_s, tick, strict, keep_bars=100000, range_effort=range_effort) if ctx_rows else None
+    btc = WyckoffEngine(ctx_tf_s, 0.1, strict, keep_bars=100000) if (btc_rows and ctx_tf_s) else None
     j = k = kb = 0
     ema = float("nan")
     cands, opens = [], []
@@ -401,7 +394,15 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
                 still.append((cand, key, sim))
             else:
                 cand["res"][key] = {"r": r, "close_t": t + tf_ms, "reason": sim.reason, "bars": idx - sim.bar}
+                cand["res_struct"].setdefault(key, cand["res"][key])  # si no se rompió antes, es el mismo resultado
         opens = still
+        brk = d.get("broke")
+        if brk:  # la estructura que sostiene la operación se rompe: ¿cerrar a mercado en vez de esperar al SL?
+            for cand, key, sim in opens:
+                if cand["kind"] != FAIL_KIND and cand["side"] == brk["side"] and key not in cand["res_struct"] \
+                        and brk["why"] in getattr(cfg, "STRUCT_EXIT_REASONS", ("DEMOTE", "INVALID")):
+                    cand["res_struct"][key] = {"r": sim.mark(c), "close_t": t + tf_ms, "reason": "estructura",
+                                               "bars": idx - sim.bar, "why": brk["why"]}
         bar_close = t + tf_ms
         while htf_ema and j < len(htf_ema) and htf_ema[j][0] <= bar_close:
             ema = htf_ema[j][1]
@@ -416,16 +417,18 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
         base = mk(exits[0][0])
         if base is None:
             continue
-        exc_ts = None if is_fail else (d["excT"] if not na(d["excT"]) else d["testT"])
-        base["flow"], base["flow_exc"] = flow_features(base["side"], rows[max(0, idx - 40):idx + 1], exc_ts)
-        base.update(edge_features(rows[max(0, idx - 500):idx + 1], base["side"], d["atr"], base["entry"], base["sl"],
-                                  exc_ts, bar_close, d["rh"], d["rl"], None if is_fail else d["excP"], d.get("clxT")))
+        base["flow"], base["flow_exc"] = flow_features(
+            base["side"], rows[max(0, idx - 40):idx + 1],
+            None if is_fail else (d["excT"] if not na(d["excT"]) else d["testT"]))
         cdir, clabel = context_of(ctx.last if ctx is not None else None)
         bdir, blabel = context_of(btc.last if btc is not None else None)
+        look = max(int(30 * 86400 / tf_s), 50)  # movimiento previo: cambio de precio en los 30 días anteriores
+        prior = round((c / rows[idx - look][4] - 1) * 100, 1) if idx >= look and rows[idx - look][4] > 0 else None
+        base.update(prior_move=prior)
         base.update(symbol=symbol, trend=trend_dir(c, ema), ctx_dir=cdir, ctx_label=clabel,
                     ctx_align=alignment(base["side"], cdir), btc_label=blabel,
                     btc_align=alignment(base["side"], bdir) if btc is not None else "neutral",
-                    open_t=bar_close, res={}, rr_by={})
+                    open_t=bar_close, res={}, res_struct={}, rr_by={})
         for key in exits:
             sig = mk(key[0])
             base["rr_by"][key] = sig["rr"]
@@ -449,7 +452,8 @@ def select_trades(cands, cfg, key=None, which="main"):
             continue
         if is_fail and cfg.FAIL_NEEDS_ENTRY and not c.get("had_entry"):
             continue
-        res = c["res"].get(key)
+        use_struct = getattr(cfg, "STRUCT_EXIT", "off") == "cierra" and not is_fail
+        res = (c.get("res_struct", {}).get(key) if use_struct else None) or c["res"].get(key)
         if res is None:
             continue  # sigue abierta al final de los datos
         sig = dict(c, rr=c["rr_by"].get(key, c["rr"]))
