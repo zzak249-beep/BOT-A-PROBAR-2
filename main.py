@@ -1105,6 +1105,8 @@ class Bot:
                 self.roll_day()
                 self.weekend_watch()
                 due = [tf for tf in ALL_TFS if now_ms() >= next_close[tf] + C.CANDLE_DELAY_S * 1000]
+                if not due:
+                    self.refresh_universe()  # se auto-limita por universe_ts; así el reintento de 5 min ocurre entre velas
                 if due:
                     self.refresh_universe()
                     for tf in sorted(due, key=C.tf_seconds, reverse=True):  # contexto antes que entradas

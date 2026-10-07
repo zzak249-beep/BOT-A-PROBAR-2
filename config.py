@@ -1,7 +1,7 @@
 """Configuración desde variables de entorno. Todos los parsers quitan comillas (lección de Railway)."""
 import os
 
-CODE_VERSION = "wyckoff-bot 4.3.2-live (2026-10-07)"
+CODE_VERSION = "wyckoff-bot 4.3.3-live (2026-10-07)"
 
 
 def _raw(name, default):
