@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 import requests
 
 import config as C
-from bingx import BingX, BingXError
+from bingx import BingX, BingXError, BingXPaused
 from notify import Journal, Telegram
 from universe import is_tradfi
 from strategy import (FAIL_KIND, MetaModel, TradeSim, alignment, breadth_label, build_fail_signal, build_signal,
@@ -76,6 +76,8 @@ class Bot:
         self.rows = {}             # (símbolo, tf) → últimas velas cerradas, para ADX / RSI / AVWAP
         self.symbols = []
         self.universe_ts = 0
+        self.paused_until = {}     # símbolo → epoch hasta el que no se le piden velas (contrato pausado)
+        self._block_alert = 0.0
         self.trend_cache = {}
         self.cooldown = {}
         self.running = True
@@ -166,6 +168,14 @@ class Bot:
             self.tg.send(f"🛑 Pérdida diaria {dl['r']:+.2f}R ≥ {C.MAX_DAILY_LOSS_R}R: sin nuevas aperturas hasta 00:00 UTC.")
 
     # ── universo y calentamiento ──
+    def usable(self, sym):
+        return self.paused_until.get(sym, 0.0) < time.time()
+
+    def mark_paused(self, sym, tf, e, hours=6):
+        if self.usable(sym):
+            log.info("%s pausado en BingX (%s): sin velas durante %dh", sym, tf, hours)
+        self.paused_until[sym] = time.time() + hours * 3600
+
     def refresh_universe(self, force=False):
         if not force and time.time() - self.universe_ts < C.UNIVERSE_REFRESH_H * 3600:
             return
@@ -174,7 +184,7 @@ class Bot:
         if C.SYMBOLS:
             syms = [norm(s) for s in C.SYMBOLS]
         else:
-            rows, skipped = [], {"categoría": 0, "volumen": 0, "API cerrada": 0}
+            rows, skipped = [], {"categoría": 0, "volumen": 0, "API cerrada": 0, "pausada": 0}
             vols = {t.get("symbol", ""): float(t.get("quoteVolume", 0) or 0) for t in self.ex.tickers()}
             for s, c in self.ex.contracts.items():
                 if c["cls"] not in C.CATEGORIES:
@@ -182,6 +192,9 @@ class Bot:
                     continue
                 if not c["api_open"]:
                     skipped["API cerrada"] += 1
+                    continue
+                if not self.usable(s):
+                    skipped["pausada"] += 1
                     continue
                 qv = vols.get(s, 0.0)
                 if qv < (C.MIN_QUOTE_VOL if c["cls"] == "crypto" else C.MIN_QUOTE_VOL_TRADFI):
@@ -209,6 +222,10 @@ class Bot:
                 self.rows.pop(key, None)
         self.symbols = [s for s in syms if all((s, tf) in self.engines for tf in C.TIMEFRAMES)]
         self.universe_ts = time.time()
+        missing = [s for s in syms if s not in self.symbols and self.usable(s)]
+        if missing:  # fallo transitorio (p. ej. bloqueo de BingX): no esperar 6 h, reintentar en 5 min
+            self.universe_ts = time.time() - C.UNIVERSE_REFRESH_H * 3600 + 300
+            log.warning("%d símbolos sin motor (%s…): se reintenta en 5 min", len(missing), ", ".join(missing[:4]))
         log.info("universo: %d símbolos · %d motores", len(self.symbols), len(self.engines))
         by = {}
         for s in self.symbols:
@@ -223,10 +240,16 @@ class Bot:
         def fetch(job):
             s, tf = job
             n = C.WARMUP_BARS if tf in C.TIMEFRAMES else C.CONTEXT_WARMUP
+            if not self.usable(s):
+                return job, None
             try:
                 return job, self.ex.klines_history(s, tf, n + 1, tf_ms(tf))
+            except BingXPaused as e:
+                self.mark_paused(s, tf, e)
+                return job, None
             except BingXError as e:
-                log.warning("warmup %s %s: %s", s, tf, e)
+                if "bloqueada" not in str(e):
+                    log.warning("warmup %s %s: %s", s, tf, e)
                 return job, None
 
         for (s, tf), rows in self.pool.map(fetch, jobs):
@@ -322,19 +345,32 @@ class Bot:
     def process_tf(self, tf):
         cut, ms = now_ms(), tf_ms(tf)
         # primero los símbolos con estructura en Fase C/D: son los que pueden dar entrada en esta vela
-        syms = sorted((s for s in self.symbols if (s, tf) in self.engines),
+        syms = sorted((s for s in self.symbols if (s, tf) in self.engines and self.usable(s)),
                       key=lambda s: 0 if (self.engines[(s, tf)].last or {}).get("phase", 0) in (PHASE_C, PHASE_D) else 1)
+
+        blocked = []
 
         def fetch(sym):
             try:
                 return sym, self.ex.klines(sym, tf, 6)
+            except BingXPaused as e:
+                self.mark_paused(sym, tf, e)
+                return sym, None
             except BingXError as e:
-                log.warning("klines %s %s: %s", sym, tf, e)
+                if "bloqueada" in str(e):
+                    blocked.append(str(e))
+                else:
+                    log.warning("klines %s %s: %s", sym, tf, e)
                 return sym, None
 
         trading = tf in C.TIMEFRAMES
         watch, rebuild = [], []
-        for sym, rows in self.pool.map(fetch, syms):
+        results = list(self.pool.map(fetch, syms))
+        if blocked and time.time() - self._block_alert > 600:
+            self._block_alert = time.time()
+            self.tg.send(f"⚠ BingX limita las peticiones de velas ({len(blocked)} símbolos sin datos en esta vela {tf}). "
+                         f"Se reintenta solo cuando BingX lo permita. Si se repite: menos símbolos o CATEGORIES=crypto.")
+        for sym, rows in results:
             eng = self.engines.get((sym, tf))
             if rows is None or eng is None:
                 continue

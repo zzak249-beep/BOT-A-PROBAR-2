@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import threading
 import hmac
 import logging
@@ -25,17 +26,8 @@ class BingXError(Exception):
     pass
 
 
-def walk_book(levels, qty):
-    """Precio medio al que se llena `qty` recorriendo niveles [(precio, cantidad)] de mejor a peor.
-    None si los niveles no alcanzan para llenarla (libro demasiado fino)."""
-    left, cost = qty, 0.0
-    for px, q in levels:
-        take = min(left, q)
-        cost += take * px
-        left -= take
-        if left <= 1e-12:
-            return cost / qty
-    return None
+class BingXPaused(BingXError):
+    """109415: el contrato existe pero está pausado (mercado cerrado / suspendido). No reintentar en horas."""
 
 
 class BingX:
@@ -46,6 +38,7 @@ class BingX:
         self.http.headers.update({"X-BX-APIKEY": key})
         self.contracts = {}
         self._hedge = None
+        self._blocked = {}  # ruta → epoch (s) hasta el que BingX la tiene bloqueada (109429)
         self._lock = threading.Lock()
         self._next_slot = 0.0
         self.min_interval = 1.0 / max(float(os.getenv("BINGX_MAX_RPS", "15")), 1.0)
@@ -62,6 +55,9 @@ class BingX:
     # ── núcleo ──
     def _req(self, method, path, params=None, signed=False, retries=3):
         params = {k: v for k, v in (params or {}).items() if v is not None}
+        until = self._blocked.get(path, 0.0)
+        if until > time.time():  # no golpear una ruta bloqueada: cada intento fallido alarga el bloqueo
+            raise BingXError(f"{path}: bloqueada por BingX {int(until - time.time())}s más (rate limit)")
         for attempt in range(retries):
             p = dict(params)
             if signed:
@@ -90,6 +86,12 @@ class BingX:
             code = j.get("code", 0)
             if code in (0, "0"):
                 return j.get("data")
+            if str(code) == "109429":  # demasiados errores en 15 min: BingX dice cuándo reintentar (epoch ms)
+                m = re.search(r"retry after time:\s*(\d+)", str(j.get("msg", "")))
+                self._blocked[path] = (int(m.group(1)) / 1000.0 if m else time.time() + 300) + 2
+                raise BingXError(f"{path}: bloqueada por BingX (rate limit 109429)")
+            if str(code) == "109415":
+                raise BingXPaused(f"{path} code=109415 {str(j.get('msg', ''))[:80]}")
             if code in (100410, 109400) and attempt < retries - 1:  # rate limit / sobrecarga
                 time.sleep(2 * (attempt + 1))
                 continue
@@ -124,47 +126,6 @@ class BingX:
     def price(self, symbol):
         d = self._req("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
         return float(d["price"])
-
-    def depth(self, symbol, limit=20):
-        """Libro: (bids de mejor a peor, asks de mejor a peor), cada nivel (precio, cantidad)."""
-        d = self._req("GET", "/openApi/swap/v2/quote/depth", {"symbol": symbol, "limit": limit}) or {}
-
-        def lv(rows):
-            out = []
-            for r in rows or []:
-                try:
-                    if isinstance(r, dict):
-                        out.append((float(r["price"]), float(r.get("quantity", r.get("qty", 0)))))
-                    else:
-                        out.append((float(r[0]), float(r[1])))
-                except (KeyError, ValueError, IndexError, TypeError):
-                    continue
-            return out
-
-        return sorted(lv(d.get("bids")), key=lambda x: -x[0]), sorted(lv(d.get("asks")), key=lambda x: x[0])
-
-    def premium_info(self, symbol):
-        """(funding %, prima mark/index %) del símbolo. Cada parte puede ser None."""
-        d = self._req("GET", "/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
-        if isinstance(d, list):
-            d = d[0] if d else {}
-        d = d or {}
-        fr = d.get("lastFundingRate")
-        fr = None if fr in (None, "") else float(fr) * 100
-        try:
-            mk, ix = float(d.get("markPrice")), float(d.get("indexPrice"))
-            pr = (mk / ix - 1) * 100 if ix > 0 else None
-        except (TypeError, ValueError):
-            pr = None
-        return fr, pr
-
-    def open_interest(self, symbol):
-        """Interés abierto actual (unidades del contrato). None si BingX no lo da para ese símbolo."""
-        d = self._req("GET", "/openApi/swap/v2/quote/openInterest", {"symbol": symbol})
-        if isinstance(d, list):
-            d = d[0] if d else {}
-        v = (d or {}).get("openInterest")
-        return None if v in (None, "") else float(v)
 
     def funding_rate(self, symbol):
         d = self._req("GET", "/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
@@ -310,6 +271,23 @@ class BingX:
                 continue
             out.append(o)
         return out
+
+    def realized_pnl(self, symbol, start_ms):
+        """PnL realizado + comisiones + funding de `symbol` desde start_ms (USDT), según el libro de ingresos
+        de BingX. None si no hay datos (el llamante cae a la estimación)."""
+        d = self._req("GET", "/openApi/swap/v2/user/income",
+                      {"symbol": symbol, "startTime": start_ms, "limit": 200}, signed=True)
+        rows = d if isinstance(d, list) else (d or {}).get("data", []) if isinstance(d, dict) else []
+        tot, n = 0.0, 0
+        for r in rows:
+            kind = str(r.get("incomeType", r.get("income_type", ""))).upper()
+            if kind in ("REALIZED_PNL", "TRADING_FEE", "FUNDING_FEE", "COMMISSION", "FEE"):
+                try:
+                    tot += float(r.get("income", 0))
+                    n += 1
+                except (TypeError, ValueError):
+                    pass
+        return tot if n else None
 
     def order_exists(self, symbol, client_id):
         """Tras un fallo de red al abrir: ¿la orden llegó al exchange?"""
