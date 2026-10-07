@@ -1,7 +1,7 @@
 """Configuración desde variables de entorno. Todos los parsers quitan comillas (lección de Railway)."""
 import os
 
-CODE_VERSION = "wyckoff-bot 5.1.0 (2026-10-03)"
+CODE_VERSION = "wyckoff-bot 4.3.0-live (2026-10-06)"
 
 
 def _raw(name, default):
@@ -106,28 +106,34 @@ FLOW_SOURCE = _s("FLOW_SOURCE", "binance").lower() # binance | off: compra/venta
 BREADTH_FILTER = _s("BREADTH_FILTER", "aviso").lower()  # off | aviso | bloquea: amplitud Wyckoff en contra
 META_MODEL = _s("META_MODEL", "meta_model.json")  # modelo entrenado con meta.py --guardar
 META_FILTER = _s("META_FILTER", "aviso").lower()  # off | aviso | bloquea (bloquea por debajo del umbral)
-# ── v5 ──
-MAX_SLIP_R = _f("MAX_SLIP_R", 0.10)             # no entra si spread + profundidad del libro cuestan más de X R (0 = off)
-DEPTH_LEVELS = _i("DEPTH_LEVELS", 20)
-ENGINE_CACHE = _b("ENGINE_CACHE", True)         # guarda los motores en /data: reinicio en segundos, no en minutos
-ENGINE_CACHE_EVERY_MIN = _i("ENGINE_CACHE_EVERY_MIN", 30)
-RISK_TARGET_DD = _f("RISK_TARGET_DD", 20.0)     # % de caída máxima tolerada (95% de los casos) para recomendar RISK_PCT
-# ── v5.1: salida por estructura y registro de eventos ──
-STRUCT_EXIT = _s("STRUCT_EXIT", "aviso").lower()           # off | aviso | cierra: si la estructura que sostiene la operación se rompe
-STRUCT_EXIT_REASONS = _list("STRUCT_EXIT_REASONS", "DEMOTE,INVALID")  # DEMOTE (D→B) · INVALID (nivel duro) · STALE (caducada)
-EVENT_LOG = _b("EVENT_LOG", True)                          # events.csv: funding, premium, OI en cada evento Wyckoff
-EVENT_OI_BINANCE = _b("EVENT_OI_BINANCE", True)            # historial de OI de Binance (solo últimos 30 días; falla en EE. UU.)
-OI_SNAPSHOTS = _b("OI_SNAPSHOTS", True)                    # guarda el OI de BingX de los símbolos con estructura, cada vela
 ATTACH_SL = _b("ATTACH_SL", True)               # SL dentro de la orden de entrada (sin ventana desnuda)
 MOVE_SL_TO_BE = _b("MOVE_SL_TO_BE", True)
 
 # ── Riesgo ──
 RISK_PCT = _f("RISK_PCT", 0.5)                   # % del equity arriesgado por operación
 LEVERAGE = _i("LEVERAGE", 5)
+NOTIONAL_USDT = _f("NOTIONAL_USDT", 0.0)         # >0 = tamaño FIJO de posición en USDT (ignora RISK_PCT). 0 = tamaño por riesgo
+SINGLE_TP = _s("SINGLE_TP", "tp1").lower()       # si la posición es tan pequeña que no se puede partir en TP1/TP2: sale entera en tp1 | tp2
 MARGIN_MODE = _s("MARGIN_MODE", "ISOLATED").upper()
 MAX_CONCURRENT = _i("MAX_CONCURRENT", 2)         # posiciones de ESTE bot
 MAX_TOTAL_POSITIONS = _i("MAX_TOTAL_POSITIONS", 4)  # posiciones de TODA la cuenta (otros bots y manuales)
 MAX_DAILY_LOSS_R = _f("MAX_DAILY_LOSS_R", 3.0)
+# ── v4.3: complementos de precisión (off | aviso = solo registra | bloquea). Se activan SOLO si el sweep los valida ──
+ADX_FILTER = _s("ADX_FILTER", "aviso").lower()    # bloquea si ADX > ADX_MAX (reversión contra tendencia fuerte)
+ADX_MAX = _f("ADX_MAX", 30.0)
+ADX_LEN = _i("ADX_LEN", 14)
+DIV_FILTER = _s("DIV_FILTER", "aviso").lower()    # bloquea si el RSI no ha perdido fuerza desde el clímax
+DIV_MIN = _f("DIV_MIN", 5.0)
+RSI_LEN = _i("RSI_LEN", 14)
+AVWAP_FILTER = _s("AVWAP_FILTER", "aviso").lower()  # bloquea si el precio está en contra del VWAP anclado al clímax
+# ── v4.1: cortacircuitos para dinero real (todos pausan las aperturas; lo abierto se sigue gestionando) ──
+MAX_DD_PCT = _f("MAX_DD_PCT", 8.0)                # caída del equity desde su máximo (%) → pausa hasta /reanudar (0 = off)
+MAX_LOSS_STREAK = _i("MAX_LOSS_STREAK", 5)        # pérdidas seguidas → pausa hasta /reanudar (0 = off)
+MAX_SLIP_R = _f("MAX_SLIP_R", 0.35)               # si el relleno real es peor que el plan en más de X R, se cierra al instante (0 = off)
+MAX_LIQ_USE_PCT = _f("MAX_LIQ_USE_PCT", 60.0)     # riesgo_stop% × apalancamiento no puede pasar de esto (el stop debe quedar lejos de la liquidación)
+TRADFI_CLOSE_FRI_UTC = _i("TRADFI_CLOSE_FRI_UTC", 20)  # viernes desde esta hora UTC CIERRA las TradFi abiertas (-1 = off)
+GONE_CONFIRMS = _i("GONE_CONFIRMS", 2)            # ciclos seguidos sin ver la posición antes de darla por cerrada
+REAL_PNL = _b("REAL_PNL", True)                   # R de cada cierre calculada con el PnL real de la cuenta (income de BingX)
 FEE_PCT = _f("FEE_PCT", 0.05)                    # comisión por lado (%) para R neta
 SLIPPAGE_PCT = _f("SLIPPAGE_PCT", 0.03)          # deslizamiento por lado (%) que descuenta el backtest
 
@@ -153,5 +159,5 @@ def tf_seconds(tf):
 def summary():
     return (f"modo {'LIVE' if LIVE else 'SIGNAL'}{' (VST)' if VST else ''} · TF {','.join(TIMEFRAMES)} · contexto {CONTEXT_TF or '-'} ({CONTEXT_FILTER})"
             f" · exigencia {ENTRY_STRICTNESS}"
-            f" · riesgo {RISK_PCT}% · x{LEVERAGE} {MARGIN_MODE} · máx {MAX_CONCURRENT} (cuenta {MAX_TOTAL_POSITIONS})"
+            f" · {(f'posición fija {NOTIONAL_USDT:g} USDT' if NOTIONAL_USDT > 0 else f'riesgo {RISK_PCT}%')} · x{LEVERAGE} {MARGIN_MODE} · máx {MAX_CONCURRENT} (cuenta {MAX_TOTAL_POSITIONS})"
             f" · R:R≥{MIN_RR} · tendencia {TREND_FILTER} {TREND_TF}")

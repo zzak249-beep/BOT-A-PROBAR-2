@@ -228,6 +228,98 @@ class MetaModel:
         return m
 
 
+# ── COMPLEMENTOS: ADX (régimen), pérdida de momentum del RSI desde el clímax, AVWAP anclado al clímax ──
+def adx_last(rows, n=14):
+    """ADX de Wilder en la última vela y su variación en 5 velas. (None, None) si no hay histórico."""
+    if len(rows) < n * 3:
+        return None, None
+    tr, pdm, mdm = [], [], []
+    for i in range(1, len(rows)):
+        h, l, pc = rows[i][2], rows[i][3], rows[i - 1][4]
+        up, dn = h - rows[i - 1][2], rows[i - 1][3] - l
+        pdm.append(up if up > dn and up > 0 else 0.0)
+        mdm.append(dn if dn > up and dn > 0 else 0.0)
+        tr.append(max(h - l, abs(h - pc), abs(l - pc)))
+    s_tr, s_p, s_m = sum(tr[:n]), sum(pdm[:n]), sum(mdm[:n])
+
+    def dx():
+        if s_tr <= 0:
+            return 0.0
+        pi, mi = 100 * s_p / s_tr, 100 * s_m / s_tr
+        return 100 * abs(pi - mi) / (pi + mi) if pi + mi > 0 else 0.0
+
+    dxs = [dx()]
+    for i in range(n, len(tr)):
+        s_tr = s_tr - s_tr / n + tr[i]
+        s_p = s_p - s_p / n + pdm[i]
+        s_m = s_m - s_m / n + mdm[i]
+        dxs.append(dx())
+    if len(dxs) < n + 6:
+        return None, None
+    a = sum(dxs[:n]) / n
+    adxs = [a]
+    for x in dxs[n:]:
+        a = (a * (n - 1) + x) / n
+        adxs.append(a)
+    return adxs[-1], adxs[-1] - adxs[-6]
+
+
+def rsi_series(closes, n=14):
+    """RSI de Wilder; None en las primeras n velas."""
+    out = [None] * len(closes)
+    if len(closes) <= n:
+        return out
+    gains = losses = 0.0
+    for i in range(1, n + 1):
+        d = closes[i] - closes[i - 1]
+        gains += max(d, 0.0)
+        losses += max(-d, 0.0)
+    ag, al = gains / n, losses / n
+    out[n] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    for i in range(n + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        ag = (ag * (n - 1) + max(d, 0.0)) / n
+        al = (al * (n - 1) + max(-d, 0.0)) / n
+        out[i] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    return out
+
+
+def ind_features(rows, idx, side, climax_t=None, adx_len=14, rsi_len=14, window=700, swing=30):
+    """Complementos medidos en la vela de entrada (misma función en bot y backtest, sin mirar el futuro).
+      adx          fuerza de tendencia: una reversión contra una tendencia fuerte (ADX alto) es más arriesgada.
+      rsi_gain     cuánto ha perdido fuerza el impulso desde el clímax: RSI en el último suelo (LONG) menos el RSI
+                   del SC; en SHORT, RSI del BC menos el RSI del último techo. + = el impulso se ha agotado.
+      avwap_align  precio a favor/en contra del VWAP anclado al clímax (¿quién controla desde el clímax?).
+    Falta de datos → None / "-": los filtros no bloquean."""
+    out = {"adx": None, "adx_slope": None, "rsi_gain": None, "avwap_align": "-", "avwap_dist": None}
+    if idx < 0 or not rows:
+        return out
+    w = rows[max(0, idx - window + 1):idx + 1]
+    adx, slope = adx_last(w, adx_len)
+    out["adx"] = None if adx is None else round(adx, 2)
+    out["adx_slope"] = None if slope is None else round(slope, 2)
+    if climax_t is None or climax_t != climax_t:
+        return out
+    k = next((i for i, r in enumerate(w) if r[0] == climax_t), None)
+    if k is None:
+        return out
+    long = side == "LONG"
+    pv = sum((r[2] + r[3] + r[4]) / 3.0 * r[5] for r in w[k:])
+    vv = sum(r[5] for r in w[k:])
+    if vv > 0:
+        av = pv / vv
+        c = w[-1][4]
+        atr = sum(max(r[2] - r[3], 1e-12) for r in w[-14:]) / len(w[-14:])
+        out["avwap_align"] = "a favor" if (c - av) * (1 if long else -1) > 0 else "en contra"
+        out["avwap_dist"] = round((c - av) / atr, 2)
+    rs = rsi_series([r[4] for r in w], rsi_len)
+    tail = range(max(0, len(w) - swing), len(w))
+    j = min(tail, key=lambda i: w[i][3]) if long else max(tail, key=lambda i: w[i][2])
+    if rs[k] is not None and rs[j] is not None:
+        out["rsi_gain"] = round((rs[j] - rs[k]) if long else (rs[k] - rs[j]), 2)
+    return out
+
+
 # ── tendencia HTF (EMA de la vela anterior ya cerrada, como el indicador v2) ──
 def ema_last(closes, n):
     if len(closes) < n:
@@ -279,6 +371,12 @@ def filters(sig, cfg, trend, ctx_align="neutral", btc_align="neutral"):
         why.append(f"estructura {cfg.CONTEXT_TF} en contra")
     if btc_align == "en contra" and cfg.BTC_FILTER == "bloquea":
         why.append(f"estructura de BTC {cfg.CONTEXT_TF} en contra")
+    if getattr(cfg, "ADX_FILTER", "off") == "bloquea" and sig.get("adx") is not None and sig["adx"] > cfg.ADX_MAX:
+        why.append(f"ADX {sig['adx']:.0f} > {cfg.ADX_MAX:g} (tendencia fuerte en contra de la reversión)")
+    if getattr(cfg, "DIV_FILTER", "off") == "bloquea" and sig.get("rsi_gain") is not None and sig["rsi_gain"] < cfg.DIV_MIN:
+        why.append(f"el impulso no se ha agotado (RSI {sig['rsi_gain']:+.0f} < {cfg.DIV_MIN:g})")
+    if getattr(cfg, "AVWAP_FILTER", "off") == "bloquea" and sig.get("avwap_align") == "en contra":
+        why.append("precio en contra del VWAP anclado al clímax")
     return why
 
 
@@ -302,12 +400,6 @@ class TradeSim:
 
     def _net(self, r):
         return r - 2.0 * self.cost / 100.0 * self.e / self.risk
-
-    def mark(self, c):
-        """R neta si se cierra a mercado al precio c (salida por estructura). Respeta el parcial de TP1 si ya se tocó."""
-        r1 = (self.t1 - self.e) * self.d / self.risk
-        rc = (c - self.e) * self.d / self.risk
-        return self._net(self.f * r1 + (1 - self.f) * rc if self.half else rc)
 
     def step(self, bar, h, l, c=None, atr=None):
         """Devuelve R neta al cerrar, o None si sigue abierta. self.reason dice cómo cerró."""
@@ -394,15 +486,7 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
                 still.append((cand, key, sim))
             else:
                 cand["res"][key] = {"r": r, "close_t": t + tf_ms, "reason": sim.reason, "bars": idx - sim.bar}
-                cand["res_struct"].setdefault(key, cand["res"][key])  # si no se rompió antes, es el mismo resultado
         opens = still
-        brk = d.get("broke")
-        if brk:  # la estructura que sostiene la operación se rompe: ¿cerrar a mercado en vez de esperar al SL?
-            for cand, key, sim in opens:
-                if cand["kind"] != FAIL_KIND and cand["side"] == brk["side"] and key not in cand["res_struct"] \
-                        and brk["why"] in getattr(cfg, "STRUCT_EXIT_REASONS", ("DEMOTE", "INVALID")):
-                    cand["res_struct"][key] = {"r": sim.mark(c), "close_t": t + tf_ms, "reason": "estructura",
-                                               "bars": idx - sim.bar, "why": brk["why"]}
         bar_close = t + tf_ms
         while htf_ema and j < len(htf_ema) and htf_ema[j][0] <= bar_close:
             ema = htf_ema[j][1]
@@ -422,13 +506,11 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
             None if is_fail else (d["excT"] if not na(d["excT"]) else d["testT"]))
         cdir, clabel = context_of(ctx.last if ctx is not None else None)
         bdir, blabel = context_of(btc.last if btc is not None else None)
-        look = max(int(30 * 86400 / tf_s), 50)  # movimiento previo: cambio de precio en los 30 días anteriores
-        prior = round((c / rows[idx - look][4] - 1) * 100, 1) if idx >= look and rows[idx - look][4] > 0 else None
-        base.update(prior_move=prior)
         base.update(symbol=symbol, trend=trend_dir(c, ema), ctx_dir=cdir, ctx_label=clabel,
                     ctx_align=alignment(base["side"], cdir), btc_label=blabel,
                     btc_align=alignment(base["side"], bdir) if btc is not None else "neutral",
-                    open_t=bar_close, res={}, res_struct={}, rr_by={})
+                    open_t=bar_close, res={}, rr_by={})
+        base.update(ind_features(rows, idx, base["side"], d.get("climT"), cfg.ADX_LEN, cfg.RSI_LEN))
         for key in exits:
             sig = mk(key[0])
             base["rr_by"][key] = sig["rr"]
@@ -452,8 +534,7 @@ def select_trades(cands, cfg, key=None, which="main"):
             continue
         if is_fail and cfg.FAIL_NEEDS_ENTRY and not c.get("had_entry"):
             continue
-        use_struct = getattr(cfg, "STRUCT_EXIT", "off") == "cierra" and not is_fail
-        res = (c.get("res_struct", {}).get(key) if use_struct else None) or c["res"].get(key)
+        res = c["res"].get(key)
         if res is None:
             continue  # sigue abierta al final de los datos
         sig = dict(c, rr=c["rr_by"].get(key, c["rr"]))

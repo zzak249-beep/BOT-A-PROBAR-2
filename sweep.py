@@ -53,7 +53,7 @@ def split(tr, cutoff):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--modo", default="entradas", choices=["entradas", "salidas"])
+    ap.add_argument("--modo", default="entradas", choices=["entradas", "salidas", "indicadores"])
     ap.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT")
     ap.add_argument("--tf", default=C.TIMEFRAME)
     ap.add_argument("--days", type=int, default=240)
@@ -78,6 +78,21 @@ def main():
             a, b, t = split(select_trades(cands[strict], cfg), cutoff)
             rows.append((f"{strict:<12}{trend:<9}{ctx:<9}{rr:>4.1f}", a, b, t))
         table(rows, len(grid), f"{'exigencia':<12}{'EMA':<9}{'ctx':<9}{'RR':>4}")
+    elif args.modo == "indicadores":
+        cands = [c for s in syms for c in load_symbol(s, args.tf, args.days, args.warmup, C.ENTRY_STRICTNESS, scan_cfg)]
+        apply_breadth(cands, TIMELINES)
+        print(f"{C.ENTRY_STRICTNESS}: {len(cands)} entradas del motor · filtros de entrada los de config")
+        times = sorted(c["open_t"] for c in cands) or [0]
+        cutoff = times[0] + (times[-1] - times[0]) * 0.7
+        grid = list(itertools.product(("off", 25.0, 35.0), ("off", 0.0, 8.0), ("off", "bloquea")))
+        rows = []
+        for adx, div, av in grid:
+            cfg = cfg_with(ADX_FILTER="off" if adx == "off" else "bloquea", ADX_MAX=35.0 if adx == "off" else adx,
+                           DIV_FILTER="off" if div == "off" else "bloquea", DIV_MIN=0.0 if div == "off" else div,
+                           AVWAP_FILTER=av)
+            a, b, t = split(select_trades(cands, cfg), cutoff)
+            rows.append((f"ADX<={str(adx):<5} RSIgain>={str(div):<4} AVWAP {av:<8}", a, b, t))
+        table(rows, len(grid), f"{'complementos':<34}")
     else:
         grid = [exit_variant(C, TP2_MULT=m, TRAIL_ATR=tr, TIME_STOP_BARS=ts)
                 for m, tr, ts in itertools.product((1.0, 1.5, 2.0), (0.0, 1.5, 3.0), (0, 32, 96))]

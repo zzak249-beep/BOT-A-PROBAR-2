@@ -721,7 +721,6 @@ class WyckoffEngine:
         hardBull0 = self.hard_level(s, DIR_ACCUM)
         hardBear0 = self.hard_level(s, DIR_DIST)
         resetWhy = -1
-        broke = None  # rotura de una estructura con dirección ya decidida (para la salida por estructura)
 
         # Retira estructuras que ya no encajan
         if s.phase == PHASE_A:
@@ -753,14 +752,12 @@ class WyckoffEngine:
                 if not na(hardBull0) and hiCInv < hardBull0 - a * structureInvalidationATR:
                     resetWhy = RS_INVALID
                 elif hiCFail < rMid0:
-                    broke = {"why": "DEMOTE", "side": "LONG", "phase": s.phase}
                     self.demote_to_b(s)
                     self.rsCounts[RS_DEMOTE] += 1
             elif s.outcome == DIR_DIST:
                 if not na(hardBear0) and loCInv > hardBear0 + a * structureInvalidationATR:
                     resetWhy = RS_INVALID
                 elif loCFail > rMid0:
-                    broke = {"why": "DEMOTE", "side": "SHORT", "phase": s.phase}
                     self.demote_to_b(s)
                     self.rsCounts[RS_DEMOTE] += 1
 
@@ -784,9 +781,6 @@ class WyckoffEngine:
                     "conf": self.conf_ws(s), "val": self.validation_ws(s, p0, trendScore, a),
                     "range_atr": self.range_atr(s, a),
                     "b_bars": (i - s.bStartBar) if not na(s.bStartBar) else 0}
-        if resetWhy in (RS_INVALID, RS_STALE) and s.outcome != DIR_NONE and broke is None:
-            broke = {"why": "INVALID" if resetWhy == RS_INVALID else "STALE",
-                     "side": "LONG" if s.outcome == DIR_ACCUM else "SHORT", "phase": s.phase}
         if resetWhy >= 0:
             self.reset(resetWhy)
             s = self.s
@@ -1293,7 +1287,8 @@ class WyckoffEngine:
             "excP": s.excPrice, "testP": s.testPrice,
             "entry_now": entry_now, "entryKind": s.entryKind, "entryPrice": s.entryPrice, "entryTime": s.entryTime,
             "range_atr": self.range_atr(s, a), "b_bars": (i - s.bStartBar) if not na(s.bStartBar) else 0,
-            "excT": s.excTime, "testT": s.testTime, "fail": fail, "broke": broke,
+            "excT": s.excTime, "testT": s.testTime, "fail": fail,
+            "climT": s.climaxTime,
         }
         return self.last
 

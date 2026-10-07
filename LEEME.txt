@@ -1,0 +1,14 @@
+CONTENIDO: main.py strategy.py wyckoff_engine.py config.py notify.py requirements.txt (bot)
+           backtest.py sweep.py test_engine.py test_ind.py ESTRATEGIA.md (medición)
+           railway.env (variables para Railway -> Variables -> Raw Editor)
+
+NO INCLUIDOS (no los tengo): bingx.py y universe.py. main.py los importa. Conserva los que ya
+tienes en tu repo de GitHub; no los borres al subir estos archivos.
+
+PASOS
+1. Sube estos archivos al repo (sobrescribiendo los del mismo nombre; deja bingx.py y universe.py).
+2. En Railway: borra TODAS las variables antiguas y pega railway.env. Rellena key, secret, token, chat id.
+3. Comprueba que el volumen /data esta montado.
+4. Antes de operar: ejecuta  python main.py --preflight  (no envia ordenes: comprueba claves, modo hedge/one-way, volumen).
+5. Primera prueba recomendada: BINGX_VST=true con keys de la cuenta demo; verifica SL adjunto, tamano y /cerrartodo SI.
+6. Pasa a real con BINGX_VST=false. El primer mensaje debe decir: modo LIVE, TF 15m, posicion fija 10 USDT, x3 ISOLATED, max 1.

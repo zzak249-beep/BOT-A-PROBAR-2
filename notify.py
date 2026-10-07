@@ -70,7 +70,7 @@ class Telegram:
 class Journal:
     FIELDS = ["open_time", "close_time", "symbol", "tf", "side", "kind", "entry_expected", "entry_real", "slippage_pct",
               "sl", "tp1", "tp2", "rr_plan", "qty", "exit_reason", "r_net", "minutes", "conf", "val",
-              "against_trend", "ctx_align", "ctx_label", "btc_align", "funding", "range_atr", "b_bars", "flow", "flow_exc", "breadth", "meta_p", "struct_r", "struct_why", "mode"]
+              "against_trend", "ctx_align", "ctx_label", "btc_align", "funding", "range_atr", "b_bars", "flow", "flow_exc", "breadth", "adx", "rsi_gain", "avwap_align", "meta_p", "mode"]
 
     def __init__(self, data_dir):
         self.path = os.path.join(data_dir, "journal.csv")
@@ -89,28 +89,3 @@ class Journal:
                 csv.DictWriter(f, fieldnames=self.FIELDS, extrasaction="ignore").writerow(row)
         except OSError as e:
             log.error("journal: %s", e)
-
-
-class EventLog:
-    """events.csv: una fila por evento Wyckoff con lo que en perpetuos delata el posicionamiento (funding, prima, OI).
-    El bot solo registra; events_report.py baja las velas posteriores y mide qué rasgos anticipan el movimiento."""
-    FIELDS = ["ts_ms", "time_utc", "symbol", "tf", "cls", "event", "dir", "price", "atr", "phase", "conf", "val",
-              "funding_pct", "premium_pct", "oi_now", "oi_chg_1h", "oi_chg_6h", "oi_chg_24h", "oi_src", "rh", "rl"]
-
-    def __init__(self, data_dir):
-        self.path = os.path.join(data_dir, "events.csv")
-        if os.path.exists(self.path):
-            with open(self.path) as f:
-                head = f.readline().strip().split(",")
-            if head != self.FIELDS:
-                os.replace(self.path, self.path.replace(".csv", f"_old_{int(time.time())}.csv"))
-        if not os.path.exists(self.path):
-            with open(self.path, "w", newline="") as f:
-                csv.writer(f).writerow(self.FIELDS)
-
-    def write(self, row):
-        try:
-            with open(self.path, "a", newline="") as f:
-                csv.DictWriter(f, fieldnames=self.FIELDS, extrasaction="ignore").writerow(row)
-        except OSError as e:
-            log.error("events: %s", e)
